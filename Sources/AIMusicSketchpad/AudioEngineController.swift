@@ -310,8 +310,14 @@ private func makeEffects(settings: EffectSettings) -> [AVAudioNode] {
         value: 0.08
     )
 
-    let reverb = AVAudioUnitReverb()
-    reverb.loadFactoryPreset(.mediumHall)
+    let drive = AVAudioUnitDistortion()
+    drive.loadFactoryPreset(.multiDistortedFunk)
+    drive.preGain = -12
+    let crush = AVAudioUnitDistortion()
+    crush.loadFactoryPreset(.multiDecimated1)
+    crush.preGain = -12
+    let filter = AVAudioUnitEQ(numberOfBands: 1)
+    let reverb = TrackReverb()
     reverb.wetDryMix = Float(settings.reverb * 100)
 
     let delay = AVAudioUnitDelay()
@@ -319,7 +325,7 @@ private func makeEffects(settings: EffectSettings) -> [AVAudioNode] {
     delay.feedback = 22
     delay.lowPassCutoff = 9_000
     delay.wetDryMix = Float(settings.delay * 100)
-    let effects: [AVAudioNode] = [eq, compressor, reverb, delay]
+    let effects: [AVAudioNode] = [eq, compressor, drive, crush, filter, reverb, delay]
     configureEffects(effects, settings: settings)
     return effects
 }
@@ -418,14 +424,47 @@ enum TransportClock {
     }
 }
 
+private final class TrackReverb: AVAudioUnitReverb {
+    private var loadedSpace: ReverbSpace?
+    func setSpace(_ space: ReverbSpace) {
+        guard loadedSpace != space else { return }
+        switch space {
+        case .room: loadFactoryPreset(.smallRoom)
+        case .plate: loadFactoryPreset(.plate)
+        case .hall: loadFactoryPreset(.mediumHall)
+        case .cathedral: loadFactoryPreset(.cathedral)
+        }
+        loadedSpace = space
+    }
+}
+
 private func configureEffects(_ effects: [AVAudioNode], settings: EffectSettings) {
-    guard effects.count == 4, let eq = effects[0] as? AVAudioUnitEQ,
+    guard effects.count == 7, let eq = effects[0] as? AVAudioUnitEQ,
           let compressor = effects[1] as? AVAudioUnitEffect,
-          let reverb = effects[2] as? AVAudioUnitReverb, let delay = effects[3] as? AVAudioUnitDelay else { return }
+          let drive = effects[2] as? AVAudioUnitDistortion, let crush = effects[3] as? AVAudioUnitDistortion,
+          let filter = effects[4] as? AVAudioUnitEQ,
+          let reverb = effects[5] as? TrackReverb, let delay = effects[6] as? AVAudioUnitDelay else { return }
     for (band, gain) in zip(eq.bands, [settings.lowGain, settings.midGain, settings.highGain]) { band.gain = Float(gain) }
     compressor.bypass = settings.compression == 0
     setAudioUnitParameter(compressor.audioUnit, id: AudioUnitParameterID(kDynamicsProcessorParam_Threshold), value: Float(-5 - settings.compression * 35))
     setAudioUnitParameter(compressor.audioUnit, id: AudioUnitParameterID(kDynamicsProcessorParam_HeadRoom), value: Float(40 - settings.compression * 35))
+    reverb.setSpace(settings.reverbSpace)
+    // Loading a factory space can reset mix parameters.
     reverb.wetDryMix = Float(settings.reverb * 100)
     delay.wetDryMix = Float(settings.delay * 100)
+    delay.delayTime = max(0.01, min(2, settings.delayTime))
+    delay.feedback = Float(max(0, min(0.85, settings.delayFeedback)) * 100)
+    drive.bypass = settings.drive <= 0
+    drive.wetDryMix = Float(max(0, min(1, settings.drive)) * 100)
+    crush.bypass = settings.bitCrush <= 0
+    crush.wetDryMix = Float(max(0, min(1, settings.bitCrush)) * 100)
+    let band = filter.bands[0]
+    band.bypass = settings.filterMode == .off
+    switch settings.filterMode {
+    case .off, .lowPass: band.filterType = .resonantLowPass
+    case .highPass: band.filterType = .resonantHighPass
+    case .bandPass: band.filterType = .bandPass
+    }
+    band.frequency = Float(max(20, min(20_000, settings.filterCutoff)))
+    band.bandwidth = Float(2 - max(0, min(1, settings.filterResonance)) * 1.7)
 }

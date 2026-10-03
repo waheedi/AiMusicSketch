@@ -11,6 +11,11 @@ enum MIDIRenderer {
     }
 
     static func loadInstrument(_ instrument: KeyboardInstrument, into sampler: AVAudioUnitSampler) throws {
+        if instrument == .aurora { try AuroraKit.load(into: sampler); return }
+        if instrument == .signature {
+            try SignatureKit.load(into: sampler)
+            return
+        }
         if let path = instrument.libraryPath {
             guard FileManager.default.fileExists(atPath: path) else {
                 throw MessageError("\(instrument.rawValue) needs its installed Logic/GarageBand sound library. Missing instrument: \(path)")
@@ -97,16 +102,41 @@ enum MIDIRenderer {
 
     static func render(notes: [MIDINote], instrument: KeyboardInstrument, bpm: Double,
                        durationBeats: Double, sampleRate: Double, to url: URL) throws -> Double {
+        try render(notes: notes, configuration: InstrumentConfiguration(builtIn: instrument), bpm: bpm,
+                   durationBeats: durationBeats, sampleRate: sampleRate, to: url)
+    }
+
+    static func render(notes: [MIDINote], configuration: InstrumentConfiguration, bpm: Double,
+                       durationBeats: Double, sampleRate: Double, to url: URL, allowEmpty: Bool = false) throws -> Double {
         guard bpm.isFinite, bpm > 0, durationBeats.isFinite, durationBeats > 0,
               durationBeats * 60 / bpm < 3_600 else { throw StudioError.invalidAudio }
         let duration = durationBeats * 60 / bpm
         let totalFrames = Int64((duration * sampleRate).rounded())
         let engine = AVAudioEngine()
-        let sampler = AVAudioUnitSampler()
+        let hosted: HostedInstrument
+        switch configuration.mode {
+        case .builtIn:
+            let sampler = AVAudioUnitSampler()
+            hosted = try HostedInstrument(unit: sampler)
+        case .synth:
+            hosted = try HostedInstrument(synth: configuration.synth, sampleRate: sampleRate)
+        case .kick:
+            hosted = try HostedInstrument(synth: SynthSettings(), sampleRate: sampleRate, kick: configuration.kickSettings)
+        case .oud:
+            hosted = try HostedInstrument(synth: SynthSettings(), sampleRate: sampleRate, oud: configuration.oudSettings)
+        case .violin:
+            hosted = try HostedInstrument(synth: SynthSettings(), sampleRate: sampleRate, violin: configuration.violinSettings)
+        case .shaker:
+            hosted = try HostedInstrument(synth: SynthSettings(), sampleRate: sampleRate, shaker: configuration.shakerSettings)
+        case .audioUnit:
+            throw MessageError("Note editing is available for Sound Library and built-in sound-creator takes, not third-party Audio Units.")
+        }
         let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2)!
-        engine.attach(sampler)
-        engine.connect(sampler, to: engine.mainMixerNode, format: format)
-        try loadInstrument(instrument, into: sampler)
+        engine.attach(hosted.node)
+        engine.connect(hosted.node, to: engine.mainMixerNode, format: format)
+        if configuration.mode == .builtIn, let sampler = hosted.node as? AVAudioUnitSampler {
+            try loadInstrument(configuration.builtIn, into: sampler)
+        }
         engine.mainMixerNode.outputVolume = 0.65
         try engine.enableManualRenderingMode(.offline, format: format, maximumFrameCount: 4_096)
         try engine.start()
@@ -131,7 +161,7 @@ enum MIDIRenderer {
             events.append(Event(frame: end, pitch: UInt8(note.pitch), velocity: 0, on: false))
         }
         events.sort { $0.frame == $1.frame ? (!$0.on && $1.on) : $0.frame < $1.frame }
-        guard !events.isEmpty else { throw MessageError("No playable notes were generated.") }
+        guard !events.isEmpty || allowEmpty else { throw MessageError("No playable notes were generated.") }
         var settings = format.settings
         settings[AVLinearPCMIsNonInterleaved] = false
         let file = try AVAudioFile(forWriting: url, settings: settings)
@@ -142,8 +172,7 @@ enum MIDIRenderer {
             let position = engine.manualRenderingSampleTime
             while eventIndex < events.count, events[eventIndex].frame <= position {
                 let event = events[eventIndex]
-                if event.on { sampler.startNote(event.pitch, withVelocity: event.velocity, onChannel: 0) }
-                else { sampler.stopNote(event.pitch, onChannel: 0) }
+                hosted.note(event.pitch, velocity: event.velocity, on: event.on)
                 eventIndex += 1
             }
             let nextEvent = eventIndex < events.count ? events[eventIndex].frame : totalFrames

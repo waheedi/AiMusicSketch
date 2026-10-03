@@ -12,6 +12,12 @@ struct AIMusicSketchpadApp: App {
         }
         .windowStyle(.titleBar)
         .commands {
+            CommandGroup(replacing: .undoRedo) {
+                Button("Undo \(studio.history.undoTitle)") { studio.undoCommand() }
+                    .keyboardShortcut("z").disabled(!studio.canUndoCommand)
+                Button("Redo \(studio.history.redoTitle)") { studio.redoCommand() }
+                    .keyboardShortcut("z", modifiers: [.command, .shift]).disabled(!studio.canRedoCommand)
+            }
             CommandGroup(replacing: .pasteboard) {
                 Button("Copy") { studio.copyCommand() }.keyboardShortcut("c")
                 Button("Paste") { studio.pasteCommand() }.keyboardShortcut("v")

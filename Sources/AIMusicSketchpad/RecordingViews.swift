@@ -14,13 +14,6 @@ struct RecordingPanel: View {
                 }
                 .frame(width: 290)
                 .disabled(studio.editingLocked)
-                if studio.recording.source == .keyboard {
-                    Picker("Sound", selection: Binding(get: { studio.recording.instrument }, set: { studio.recording.instrument = $0 })) {
-                        ForEach(KeyboardInstrument.allCases) { Text($0.rawValue).tag($0) }
-                    }
-                    .frame(width: 220)
-                    .disabled(studio.editingLocked)
-                }
                 Spacer()
                 Button {
                     if studio.recording.isRecording { studio.stop() }
@@ -31,7 +24,7 @@ struct RecordingPanel: View {
                 }
                 .tint(.red)
                 .buttonStyle(.borderedProminent)
-                .disabled(studio.isBusy)
+                .disabled(studio.isBusy || studio.recording.isLoadingInstrument)
                 Button {
                     studio.recording.panic()
                     studio.showRecordingPanel = false
@@ -39,8 +32,9 @@ struct RecordingPanel: View {
                 .disabled(studio.editingLocked)
             }
             if studio.recording.source == .keyboard {
+                InstrumentControls(studio: studio)
                 HStack {
-                    Text("Click keys to focus • A W S E D F T G Y H U J K • Esc releases notes")
+                    Text("Click keys • A W S E D F T G Y H U J K L Ö Ä # • 1–6 octave • Esc releases")
                         .font(.caption).foregroundStyle(.secondary)
                     Stepper("Octave \(studio.recording.octave)", value: Binding(get: { studio.recording.octave }, set: { studio.recording.octave = $0 }), in: 1...6)
                         .frame(width: 125)
@@ -50,7 +44,10 @@ struct RecordingPanel: View {
                 }
                 PianoKeyboard(recording: studio.recording, focusToken: focusToken)
                     .frame(height: 100)
-                if studio.recording.instrument.isElectronicDrumKit {
+                if studio.recording.configuration.mode == .builtIn && studio.recording.instrument.isOriginalKit {
+                    Text("\(studio.recording.instrument.rawValue) • \(studio.recording.octave): \(studio.recording.instrument.bankNames[studio.recording.octave - 1]) • " + studio.recording.instrument.bankNames.enumerated().map { "\($0.offset + 1) \($0.element)" }.joined(separator: " · "))
+                        .font(.caption).foregroundStyle(.secondary)
+                } else if studio.recording.configuration.mode == .builtIn && studio.recording.instrument.isElectronicDrumKit {
                     Text("Drum sounds use octaves 2–3 (MIDI 36–58). Unassigned keys are silent; drums do not repeat across every octave.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
@@ -70,12 +67,6 @@ struct RecordingPanel: View {
         .onChange(of: studio.recording.source) { _, source in
             studio.recording.panic()
             if source == .keyboard { studio.prepareKeyboard(); focusToken += 1 }
-        }
-        .onChange(of: studio.recording.instrument) { _, instrument in
-            if instrument.isPercussion { studio.recording.octave = 2 }
-            else if instrument == .oud { studio.recording.octave = 3 }
-            else { studio.recording.octave = 4 }
-            studio.prepareKeyboard()
         }
         .onChange(of: studio.recording.isRecording) { _, recording in
             if recording { focusToken += 1 }
@@ -102,20 +93,20 @@ private struct PianoKeyboard: NSViewRepresentable {
     static func dismantleNSView(_ view: PianoKeyView, coordinator: ()) { view.releaseKeys() }
 }
 
-private final class PianoKeyView: NSView {
+final class PianoKeyView: NSView {
     weak var recording: RecordingController?
     var focusToken = 0
-    private var held: [UInt16: Int] = [:]
+    private(set) var held: [UInt16: Int] = [:]
     private var mousePitch: Int?
-    private let keyCodes: [UInt16] = [0, 13, 1, 14, 2, 3, 17, 5, 16, 4, 32, 38, 40]
-    private let labels = ["A", "W", "S", "E", "D", "F", "T", "G", "Y", "H", "U", "J", "K"]
-    private let whites = [0, 2, 4, 5, 7, 9, 11, 12]
-    private let blacks = [1, 3, 6, 8, 10]
+    private static let keyCodes: [UInt16] = [0, 13, 1, 14, 2, 3, 17, 5, 16, 4, 32, 38, 40, 37, 41, 39, 42]
+    private let labels = ["A", "W", "S", "E", "D", "F", "T", "G", "Y", "H", "U", "J", "K", "L", "Ö", "Ä", "#"]
+    private let whites = [0, 2, 4, 5, 7, 9, 11, 12, 14, 16]
+    private let blacks = [1, 3, 6, 8, 10, 13, 15]
     override var acceptsFirstResponder: Bool { true }
     override var isFlipped: Bool { true }
 
     private func rect(_ semitone: Int) -> NSRect {
-        let width = bounds.width / 8
+        let width = bounds.width / Double(whites.count)
         if let index = whites.firstIndex(of: semitone) {
             return NSRect(x: Double(index) * width + 1, y: 1, width: width - 2, height: bounds.height - 2)
         }
@@ -136,6 +127,17 @@ private final class PianoKeyView: NSView {
             ]
             let area = rect(semitone)
             (labels[semitone] as NSString).draw(at: NSPoint(x: area.midX - 4, y: area.maxY - 20), withAttributes: attributes)
+            if recording?.configuration.mode == .builtIn && recording?.instrument.isOriginalKit == true {
+                let paragraph = NSMutableParagraphStyle()
+                paragraph.alignment = .center
+                paragraph.lineBreakMode = .byTruncatingTail
+                var soundAttributes = attributes
+                soundAttributes[.font] = NSFont.systemFont(ofSize: 9)
+                soundAttributes[.paragraphStyle] = paragraph
+                ((recording?.instrument == .aurora ? AuroraKit.label(for: base + semitone) : SignatureKit.label(for: base + semitone)) as NSString).draw(
+                    in: NSRect(x: area.minX + 2, y: area.maxY - 38, width: area.width - 4, height: 14),
+                    withAttributes: soundAttributes)
+            }
         }
         if window?.firstResponder === self {
             NSColor.systemPurple.setStroke()
@@ -144,14 +146,32 @@ private final class PianoKeyView: NSView {
     }
     override func becomeFirstResponder() -> Bool { needsDisplay = true; return true }
     override func resignFirstResponder() -> Bool { releaseKeys(); needsDisplay = true; return true }
+    static func octaveShortcut(from event: NSEvent) -> Int? {
+        guard event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+              let characters = event.characters, characters.count == 1,
+              let octave = Int(characters), (1...6).contains(octave) else { return nil }
+        return octave
+    }
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 { recording?.panic(); held.removeAll(); return }
-        guard !event.modifierFlags.contains(.command), !event.modifierFlags.contains(.control),
-              let semitone = keyCodes.firstIndex(of: event.keyCode) else { super.keyDown(with: event); return }
+        if let octave = Self.octaveShortcut(from: event) {
+            if !event.isARepeat { recording?.octave = octave; needsDisplay = true }
+            return
+        }
+        guard event.modifierFlags.intersection([.command, .control, .option]).isEmpty else {
+            super.keyDown(with: event); return
+        }
+        guard let semitone = Self.semitone(from: event) else { super.keyDown(with: event); return }
         guard !event.isARepeat else { return }
         let pitch = ((recording?.octave ?? 4) + 1) * 12 + semitone
         held[event.keyCode] = pitch
         recording?.noteOn(pitch)
+    }
+    static func semitone(from event: NSEvent) -> Int? {
+        guard event.modifierFlags.intersection([.command, .control, .option]).isEmpty else { return nil }
+        let extra = ["l": 13, "ö": 14, "ä": 15, "#": 16]
+        if let text = event.charactersIgnoringModifiers?.lowercased(), let note = extra[text] { return note }
+        return keyCodes.firstIndex(of: event.keyCode)
     }
     override func keyUp(with event: NSEvent) {
         if let pitch = held.removeValue(forKey: event.keyCode) { recording?.noteOff(pitch) }

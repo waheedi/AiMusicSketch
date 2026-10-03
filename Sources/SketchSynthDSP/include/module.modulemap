@@ -1,0 +1,4 @@
+module SketchSynthDSP {
+    header "SketchSynthDSP.h"
+    export *
+}

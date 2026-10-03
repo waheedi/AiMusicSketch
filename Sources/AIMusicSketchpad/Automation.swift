@@ -3,11 +3,15 @@ import Foundation
 enum AutomationParameter: String, Codable, CaseIterable, Identifiable {
     case volume = "Volume", pan = "Pan", lowGain = "Low EQ", midGain = "Mid EQ", highGain = "High EQ"
     case compression = "Compression", reverb = "Reverb", delay = "Delay"
+    case drive = "Drive", bitCrush = "Bit-crush", filterCutoff = "Filter cutoff", filterResonance = "Filter resonance"
+    case delayTime = "Delay time", delayFeedback = "Delay feedback"
     var id: String { rawValue }
     var scale: Double {
         switch self { case .lowGain, .midGain, .highGain: 24; default: 1 }
     }
     func label(_ value: Double) -> String {
+        if self == .filterCutoff { return String(format: "%+.1f octaves", value * 5) }
+        if self == .delayTime { return String(format: "%+.2f s", value) }
         let unit = scale == 24 ? "dB" : "%"
         return String(format: "%+.0f %@", value * (scale == 24 ? 24 : 100), unit)
     }
@@ -53,6 +57,12 @@ extension TrackModel {
             case .compression: result.effects.compression = max(0, min(1, effects.compression + offset))
             case .reverb: result.effects.reverb = max(0, min(1, effects.reverb + offset))
             case .delay: result.effects.delay = max(0, min(1, effects.delay + offset))
+            case .drive: result.effects.drive = max(0, min(1, effects.drive + offset))
+            case .bitCrush: result.effects.bitCrush = max(0, min(1, effects.bitCrush + offset))
+            case .filterCutoff: result.effects.filterCutoff = max(20, min(20_000, effects.filterCutoff * pow(2, offset * 5)))
+            case .filterResonance: result.effects.filterResonance = max(0, min(1, effects.filterResonance + offset))
+            case .delayTime: result.effects.delayTime = max(0.01, min(2, effects.delayTime + offset))
+            case .delayFeedback: result.effects.delayFeedback = max(0, min(0.85, effects.delayFeedback + offset))
             }
         }
         return result

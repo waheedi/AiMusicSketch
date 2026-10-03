@@ -1,6 +1,32 @@
 import Foundation
 
 enum ClipEditing {
+    /// Resize without changing speed or modifying the source file. Looped clips
+    /// may grow in either direction; ordinary clips stop at their source bounds.
+    static func resize(_ clip: ClipModel, leftEdge: Bool, to beat: Double, bpm: Double) -> ClipModel {
+        guard beat.isFinite, bpm.isFinite, bpm > 0 else { return clip }
+        var result = clip
+        let secondsPerBeat = 60 / bpm
+        let phase = clip.playbackOffsetSeconds ?? 0
+        let minimum = min(0.0625, clip.durationBeats)
+        if leftEdge {
+            let earliest = clip.loopEnabled ? 0 : max(0, clip.startBeat - phase / secondsPerBeat)
+            let start = max(earliest, min(clip.endBeat - minimum, beat))
+            let elapsed = phase + (start - clip.startBeat) * secondsPerBeat
+            let region = clip.sourceRegionSeconds
+            result.playbackOffsetSeconds = clip.loopEnabled
+                ? (elapsed.truncatingRemainder(dividingBy: region) + region).truncatingRemainder(dividingBy: region)
+                : max(0, elapsed)
+            result.startBeat = start
+            result.durationBeats = clip.endBeat - start
+        } else {
+            let latest = clip.loopEnabled ? 99_999 : clip.startBeat + max(0, clip.sourceRegionSeconds - phase) / secondsPerBeat
+            let end = max(clip.startBeat + minimum, min(latest, beat))
+            result.durationBeats = end - clip.startBeat
+        }
+        return result
+    }
+
     static func split(_ clip: ClipModel, at beat: Double, bpm: Double) throws -> (ClipModel, ClipModel) {
         guard beat > clip.startBeat, beat < clip.endBeat else {
             throw MessageError("Place the playhead inside the clip first.")

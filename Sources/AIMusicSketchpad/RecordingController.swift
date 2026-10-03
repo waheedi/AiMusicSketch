@@ -26,12 +26,20 @@ struct RecordedTake {
     let notes: [MIDINote]
     let durationBeats: Double
     let instrument: KeyboardInstrument
+    var addOn: InstrumentConfiguration? = nil
 }
 
 @MainActor
 final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDelegate {
     @Published var source: RecordingSource = .microphone
-    @Published var instrument: KeyboardInstrument = .piano
+    @Published var configuration = InstrumentConfiguration()
+    var instrument: KeyboardInstrument {
+        get { configuration.builtIn }
+        set { configuration.builtIn = newValue }
+    }
+    @Published private(set) var isLoadingInstrument = false
+    @Published private(set) var installedAudioUnits: [AudioUnitID] = []
+    @Published var instrumentMessage = ""
     @Published var octave = 4
     @Published private(set) var isRecording = false
     @Published private(set) var activePitches = Set<Int>()
@@ -41,8 +49,12 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
 
     private var recorder: AVAudioRecorder?
     private var engine: AVAudioEngine?
-    private var sampler: AVAudioUnitSampler?
-    private var activeInstrument: KeyboardInstrument?
+    private(set) var hostedInstrument: HostedInstrument?
+    private var loadedConfiguration: InstrumentConfiguration?
+    private var loadRevision = 0
+    private var instrumentCapture: InstrumentAudioCapture?
+    private var recordingAddOn: InstrumentConfiguration?
+    private let editorWindow = InstrumentEditorWindow()
     private var midiClient = MIDIClientRef()
     private var midiPort = MIDIPortRef()
     private var connectedSources = Set<MIDIEndpointRef>()
@@ -80,7 +92,7 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
             guard recorder.prepareToRecord() else { throw MessageError("The current audio input could not be opened.") }
             self.recorder = recorder
         } else {
-            try prepareKeyboard()
+            try await prepareKeyboard()
         }
     }
 
@@ -90,6 +102,7 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
         self.bpm = bpm
         recordingSource = source
         recordingInstrument = instrument
+        recordingAddOn = source != .keyboard || configuration.mode == .builtIn ? nil : try snapshotConfiguration()
         capture = NoteCapture()
         if source == .microphone {
             guard let recorder else { throw MessageError("Microphone was not prepared.") }
@@ -98,6 +111,13 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
             guard recorder.record(atTime: recorder.deviceCurrentTime + delay) else {
                 throw MessageError("The audio input did not start recording.")
             }
+        } else if configuration.mode != .builtIn {
+            guard let engine else { throw MessageError("Instrument was not prepared.") }
+            let format = engine.mainMixerNode.outputFormat(forBus: 0)
+            let url = AssetManager.shared.newAssetURL(prefix: "Instrument-take").deletingPathExtension().appendingPathExtension("caf")
+            let sink = try InstrumentAudioCapture(url: url, format: format, anchor: anchor)
+            instrumentCapture = sink
+            engine.mainMixerNode.installTap(onBus: 0, bufferSize: 1_024, format: nil) { buffer, time in sink.append(buffer, time: time) }
         }
         isRecording = true
         meterTask = Task { [weak self] in
@@ -118,45 +138,96 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
         meterTask = nil
         inputLevel = 0
         panic()
-        let url = recorder?.url
+        var url = recorder?.url
         recorder?.stop()
         recorder = nil
+        if let sink = instrumentCapture {
+            engine?.mainMixerNode.removeTap(onBus: 0)
+            instrumentCapture = nil
+            try sink.finish()
+            url = sink.url
+        }
         if recordingSource == .keyboard, notes.isEmpty {
             throw MessageError("No notes were played. Click the keyboard to focus it, or connect a MIDI keyboard, then record again.")
         }
-        return RecordedTake(url: recordingSource == .microphone ? url : nil, notes: notes,
-                            durationBeats: durationBeats, instrument: recordingInstrument)
+        return RecordedTake(url: url, notes: notes, durationBeats: durationBeats,
+                            instrument: recordingInstrument, addOn: recordingAddOn)
     }
 
     func cancelPreparation() {
         recorder?.stop()
         recorder = nil
+        if instrumentCapture != nil { engine?.mainMixerNode.removeTap(onBus: 0); instrumentCapture = nil }
     }
 
-    func prepareKeyboard() throws {
-        if engine == nil {
-            let engine = AVAudioEngine()
-            let sampler = AVAudioUnitSampler()
-            engine.attach(sampler)
-            engine.connect(sampler, to: engine.mainMixerNode, format: nil)
-            engine.mainMixerNode.outputVolume = 0.65
-            self.engine = engine
-            self.sampler = sampler
+    func prepareKeyboard() async throws {
+        guard !isRecording else { return }
+        let requested = configuration
+        if let loaded = loadedConfiguration, loaded == requested, let engine {
+            if !engine.isRunning { try engine.start() }
+            return
         }
-        if activeInstrument != instrument, let sampler {
-            panic()
-            try MIDIRenderer.loadInstrument(instrument, into: sampler)
-            activeInstrument = instrument
+        loadRevision += 1
+        let revision = loadRevision
+        isLoadingInstrument = true
+        defer { if revision == loadRevision { isLoadingInstrument = false } }
+        panic(); editorWindow.close()
+        engine?.stop(); engine = nil; hostedInstrument = nil; loadedConfiguration = nil
+        instrumentMessage = "Loading \(requested.name)…"
+        let hosted: HostedInstrument
+        if requested.mode == .builtIn { hosted = try HostedInstrument(unit: AVAudioUnitSampler()) }
+        else { hosted = try await HostedInstrument.make(requested, sampleRate: 48_000) }
+        guard revision == loadRevision else { throw CancellationError() }
+        let next = AVAudioEngine()
+        next.attach(hosted.node)
+        let format = hosted.synth == nil ? nil : AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)
+        next.connect(hosted.node, to: next.mainMixerNode, format: format)
+        // EXS sample instruments require the sampler to belong to an engine.
+        if requested.mode == .builtIn, let sampler = hosted.node as? AVAudioUnitSampler {
+            try MIDIRenderer.loadInstrument(requested.builtIn, into: sampler)
         }
-        if let engine, !engine.isRunning { try engine.start() }
+        next.mainMixerNode.outputVolume = 0.65
+        try next.start()
+        engine = next; hostedInstrument = hosted; loadedConfiguration = requested
+        instrumentMessage = "\(requested.name) ready"
         refreshMIDI()
     }
 
+    func refreshAudioUnits() { installedAudioUnits = AudioUnitID.installed() }
+    func unloadKeyboard() {
+        guard !isRecording else { return }
+        loadRevision += 1; isLoadingInstrument = false
+        panic(); editorWindow.close(); engine?.stop()
+        engine = nil; hostedInstrument = nil; loadedConfiguration = nil
+        instrumentMessage = "Choose an installed instrument."
+    }
+    func applySynthSettings() {
+        if configuration.mode == .kick { hostedInstrument?.synth?.configureKick(configuration.kickSettings) }
+        else if configuration.mode == .oud { hostedInstrument?.synth?.configureOud(configuration.oudSettings) }
+        else if configuration.mode == .violin { hostedInstrument?.synth?.configureViolin(configuration.violinSettings) }
+        else if configuration.mode == .shaker { hostedInstrument?.synth?.configureShaker(configuration.shakerSettings) }
+        else { hostedInstrument?.synth?.configure(configuration.synth) }
+        if loadedConfiguration?.mode == configuration.mode { loadedConfiguration = configuration }
+    }
+    func snapshotConfiguration() throws -> InstrumentConfiguration {
+        guard let hostedInstrument, loadedConfiguration?.mode == configuration.mode,
+              loadedConfiguration?.audioUnit == configuration.audioUnit else { return configuration }
+        return try hostedInstrument.snapshot(configuration)
+    }
+    func showPluginEditor() async throws {
+        guard !isRecording, let unit = hostedInstrument?.unit, configuration.mode == .audioUnit else { return }
+        let controller = await InstrumentEditorWindow.controller(for: unit)
+        guard hostedInstrument?.unit === unit else { return }
+        if let controller { editorWindow.show(controller, title: configuration.name) }
+        else { throw MessageError("This plug-in does not provide a custom window. Use its parameters and factory presets below.") }
+    }
+    func closePluginEditor() { editorWindow.close() }
+
     func noteOn(_ pitch: Int, velocity: UInt8 = 100, hostTime: UInt64 = 0) {
-        guard source == .keyboard, (0..<128).contains(pitch), sampler != nil else { return }
+        guard source == .keyboard, !isLoadingInstrument, (0..<128).contains(pitch), hostedInstrument != nil else { return }
         let pitch = UInt8(pitch)
         sustained.remove(pitch)
-        sampler?.startNote(pitch, withVelocity: velocity, onChannel: 0)
+        hostedInstrument?.note(pitch, velocity: velocity, on: true)
         activePitches.insert(Int(pitch))
         if isRecording && recordingSource == .keyboard {
             capture.on(pitch, velocity: velocity, beat: relativeBeat(hostTime))
@@ -166,7 +237,7 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
     func noteOff(_ pitch: Int, hostTime: UInt64 = 0) {
         guard (0..<128).contains(pitch) else { return }
         if sustaining { sustained.insert(UInt8(pitch)); return }
-        sampler?.stopNote(UInt8(pitch), onChannel: 0)
+        hostedInstrument?.note(UInt8(pitch), velocity: 0, on: false)
         activePitches.remove(pitch)
         if isRecording && recordingSource == .keyboard { capture.off(UInt8(pitch), beat: relativeBeat(hostTime)) }
     }
@@ -176,7 +247,7 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
         sustained.removeAll()
         for pitch in activePitches { noteOff(pitch) }
         activePitches.removeAll()
-        sampler?.sendController(123, withValue: 0, onChannel: 0)
+        hostedInstrument?.panic()
     }
 
     private func relativeBeat(_ hostTime: UInt64 = 0) -> Double {

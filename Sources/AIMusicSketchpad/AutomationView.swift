@@ -6,6 +6,7 @@ struct AutomationEditor: View {
     let parameter: AutomationParameter
     let beatWidth: Double
     @State private var selectedPointID: UUID?
+    @State private var editingPoint = false
     private var lane: AutomationLane { track.automation?.first { $0.parameter == parameter } ?? AutomationLane(parameter: parameter) }
     private var coordinateSpace: String { "automation-\(track.id)-\(parameter.rawValue)" }
     private var pixelsPerSecond: Double { beatWidth * studio.project.bpm / 60 }
@@ -37,9 +38,12 @@ struct AutomationEditor: View {
                         .padding(6).contentShape(Rectangle())
                         .position(x: point.seconds * pixelsPerSecond, y: y(point.value, height: geometry.size.height))
                         .highPriorityGesture(DragGesture(minimumDistance: 1, coordinateSpace: .named(coordinateSpace)).onChanged { event in
+                            if !editingPoint { studio.beginEdit("Move Automation Point"); editingPoint = true }
                             selectedPointID = point.id
                             studio.setAutomationPoint(trackID: track.id, parameter: parameter, id: point.id,
                                 seconds: event.location.x / pixelsPerSecond, value: value(event.location.y, height: geometry.size.height))
+                        }.onEnded { _ in
+                            if editingPoint { studio.endEdit(); editingPoint = false }
                         })
                         .contextMenu {
                             Button("Reset point to zero") { studio.setAutomationPoint(trackID: track.id, parameter: parameter, id: point.id, seconds: point.seconds, value: 0) }
@@ -59,6 +63,7 @@ struct AutomationEditor: View {
         }
         .frame(height: 100)
         .overlay(alignment: .bottom) { Divider() }
+        .onDisappear { if editingPoint { studio.endEdit(); editingPoint = false } }
     }
     private func y(_ value: Double, height: Double) -> Double { height * (0.5 - value * 0.4) }
     private func value(_ y: Double, height: Double) -> Double { max(-1, min(1, (0.5 - y / height) / 0.4)) }

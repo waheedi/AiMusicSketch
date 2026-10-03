@@ -35,6 +35,46 @@ struct EffectSettings: Codable, Hashable {
     var compression = 0.0
     var reverb = 0.0
     var delay = 0.0
+    var drive = 0.0
+    var bitCrush = 0.0
+    var filterMode: FilterMode = .off
+    var filterCutoff = 8_000.0
+    var filterResonance = 0.0
+    var reverbSpace: ReverbSpace = .hall
+    var delayTime = 0.25
+    var delayFeedback = 0.22
+
+    init() {}
+    private enum CodingKeys: String, CodingKey {
+        case lowGain, midGain, highGain, compression, reverb, delay, drive, bitCrush
+        case filterMode, filterCutoff, filterResonance, reverbSpace, delayTime, delayFeedback
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        lowGain = try c.decodeIfPresent(Double.self, forKey: .lowGain) ?? 0
+        midGain = try c.decodeIfPresent(Double.self, forKey: .midGain) ?? 0
+        highGain = try c.decodeIfPresent(Double.self, forKey: .highGain) ?? 0
+        compression = try c.decodeIfPresent(Double.self, forKey: .compression) ?? 0
+        reverb = try c.decodeIfPresent(Double.self, forKey: .reverb) ?? 0
+        delay = try c.decodeIfPresent(Double.self, forKey: .delay) ?? 0
+        drive = try c.decodeIfPresent(Double.self, forKey: .drive) ?? 0
+        bitCrush = try c.decodeIfPresent(Double.self, forKey: .bitCrush) ?? 0
+        filterMode = try c.decodeIfPresent(FilterMode.self, forKey: .filterMode) ?? .off
+        filterCutoff = try c.decodeIfPresent(Double.self, forKey: .filterCutoff) ?? 8_000
+        filterResonance = try c.decodeIfPresent(Double.self, forKey: .filterResonance) ?? 0
+        reverbSpace = try c.decodeIfPresent(ReverbSpace.self, forKey: .reverbSpace) ?? .hall
+        delayTime = try c.decodeIfPresent(Double.self, forKey: .delayTime) ?? 0.25
+        delayFeedback = try c.decodeIfPresent(Double.self, forKey: .delayFeedback) ?? 0.22
+    }
+}
+
+enum FilterMode: String, Codable, CaseIterable, Identifiable {
+    case off = "Off", lowPass = "Low-pass", highPass = "High-pass", bandPass = "Band-pass"
+    var id: String { rawValue }
+}
+enum ReverbSpace: String, Codable, CaseIterable, Identifiable {
+    case room = "Small Room", plate = "Plate", hall = "Medium Hall", cathedral = "Cathedral"
+    var id: String { rawValue }
 }
 
 struct ClipModel: Codable, Identifiable, Hashable {
@@ -55,6 +95,11 @@ struct ClipModel: Codable, Identifiable, Hashable {
     var instrument: KeyboardInstrument?
     var generationMethod: String?
     var generationReference: GenerationReference?
+    // Tempo of the MIDI source WAV, independent of subsequent project tempo edits.
+    var midiSourceBPM: Double?
+    var instrumentAddOn: InstrumentConfiguration?
+    // Opt-in on new supported keyboard takes only; legacy recordings stay audio.
+    var notesEditable: Bool?
 
     var endBeat: Double { startBeat + durationBeats }
     var assetURL: URL { URL(fileURLWithPath: assetPath) }
@@ -76,6 +121,7 @@ struct TrackModel: Codable, Identifiable, Hashable {
     var clips: [ClipModel] = []
     var generationSettings: GenerationRequest?
     var automation: [AutomationLane]?
+    var instrumentConfiguration: InstrumentConfiguration?
 
     static func new(index: Int) -> TrackModel {
         let colors = ["4F8CFF", "A66BFF", "FF6B87", "F2A93B", "39B98A", "54B9D1", "D16BA5", "8BBF4D"]
@@ -112,6 +158,8 @@ struct GenerationRequest: Hashable, Codable {
     var input: GenerationInput = .textOnly
     var referenceStartBeat = 0.0
     var referenceEndBeat = 8.0
+    // Absolute output boundary; nil keeps the existing bars-based behavior.
+    var outputEndBeat: Double?
     var useLocalModel: Bool { engine == .localNotes }
 }
 
@@ -147,10 +195,13 @@ enum KeyboardInstrument: String, CaseIterable, Codable, Identifiable {
     case strings = "Strings", lead = "Synth lead", drums = "Drum kit"
     case house = "House Kit", oriental = "Oriental Kit", oud = "Oud"
     case deepHouse = "Deep House Kit", tr909 = "TR-909 Kit"
+    case signature = "Signature Kit", aurora = "Aurora Kit"
+    var isOriginalKit: Bool { self == .signature || self == .aurora }
+    var bankNames: [String] { self == .aurora ? AuroraKit.bankNames : SignatureKit.bankNames }
     var id: String { rawValue }
     var program: UInt8 {
         switch self {
-        case .piano, .drums, .house, .oriental, .oud, .deepHouse, .tr909: 0
+        case .piano, .drums, .house, .oriental, .oud, .deepHouse, .tr909, .signature, .aurora: 0
         case .electricPiano: 4
         case .bass: 33
         case .strings: 48

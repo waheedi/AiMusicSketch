@@ -1,7 +1,9 @@
 import AVFoundation
+import AppKit
 import Darwin
 import Foundation
 import Combine
+import SwiftUI
 
 @main
 struct SmokeTest {
@@ -17,6 +19,12 @@ struct SmokeTest {
 
     @MainActor
     private static func run() async throws {
+        try await InstrumentTests.run()
+        try assertOctaveShortcuts()
+        try assertGenerationOutputRange()
+        try assertNoteDisplay()
+        try assertEditingHistory()
+        try assertExpandedEffects()
         let studio = StudioModel()
         var observed = 0
         let subscription = studio.objectWillChange.sink { observed += 1 }
@@ -104,6 +112,10 @@ struct SmokeTest {
                 print("PASS: \(instrument.rawValue) loaded and rendered from installed Apple library")
             }
         }
+        if CommandLine.arguments.contains("--signature-kit") {
+            try assertSignatureKit()
+        }
+        if CommandLine.arguments.contains("--aurora-kit") { try assertSignatureKit(kit: .aurora) }
 
         let source = temporaryURL("source.wav")
         let mix = temporaryURL("mix.wav")
@@ -199,17 +211,20 @@ struct SmokeTest {
         try require(abs(Double(convertedFile.length) - 48_000) < 4, "converter lost final audio samples")
         try await featureChecks(source: converted)
 
-        if CommandLine.arguments.contains("--track-workflow") {
+        if CommandLine.arguments.contains("--track-workflow") || CommandLine.arguments.contains("--long-track-workflow") {
             let workflow = StudioModel()
             let original = ClipModel(name: "My recorded bass", assetPath: source.path, startBeat: 4,
                                      durationBeats: 4, sourceDurationSeconds: duration)
             workflow.project.tracks[0].clips = [original]
+            workflow.project.lengthBeats = 8
             let targetID = workflow.project.tracks[0].id
             workflow.beginGeneration(trackID: targetID, useTrack: true)
             workflow.generationRequest.bars = 1
+            let newBeats = CommandLine.arguments.contains("--long-track-workflow") ? 60.5 : 8.5
+            workflow.generationRequest.outputEndBeat = original.endBeat + newBeats
             workflow.generateMusic()
             var lastStatus = ""
-            for _ in 0..<240 where workflow.isBusy {
+            for _ in 0..<2_400 where workflow.isBusy {
                 if workflow.status != lastStatus { print(workflow.status); lastStatus = workflow.status }
                 try await Task.sleep(for: .milliseconds(500))
             }
@@ -218,10 +233,22 @@ struct SmokeTest {
             let clips = workflow.project.tracks[0].clips
             try require(clips.count == 2 && clips[0] == original && clips[1].startBeat == original.endBeat,
                         "AI replaced or overlapped the source performance")
+            try require(abs(clips[1].endBeat - (original.endBeat + newBeats)) < 0.000001,
+                        "AI output did not reach the requested out-of-bounds end beat")
+            try require(workflow.project.lengthBeats >= clips[1].endBeat && workflow.project.lengthBeats > 8,
+                        "timeline did not grow with the generated continuation")
+            let generatedFile = try AVAudioFile(forReading: clips[1].assetURL)
+            try require(abs(Double(generatedFile.length) / generatedFile.processingFormat.sampleRate - newBeats * 0.5) < 0.0001,
+                        "generated source audio is padded or truncated to the wrong duration")
             try require(clips[1].generationReference?.trackID == targetID && workflow.project.tracks[1].clips.isEmpty,
                         "AI used or wrote the wrong track")
             try assertAudibleStereo48k(clips[1].assetURL)
-            print("PASS: complete per-track AI action preserves original, records provenance, appends audible new take")
+            workflow.undo()
+            try require(workflow.project.tracks[0].clips == [original] && workflow.project.lengthBeats == 8,
+                        "undo failed to remove the AI take and timeline extension together")
+            workflow.redo()
+            try require(workflow.project.tracks[0].clips == clips, "AI continuation redo failed")
+            print("PASS: complete AI action generates through custom end beat, extends timeline, preserves original/provenance, undo/redo")
         }
 
         if CommandLine.arguments.contains("--audio-model") {
@@ -326,6 +353,402 @@ struct SmokeTest {
         let saved = try JSONDecoder().decode(StudioProject.self, from: JSONEncoder().encode(mix))
         try require(saved == mix, "automation / per-track AI / reference metadata was lost on save")
         print("PASS: cross-track copy/paste/drag, automation interpolation and audible export, single-track AI input, saved metadata")
+    }
+
+    @MainActor
+    private static func assertGenerationOutputRange() throws {
+        var project = StudioProject()
+        project.lengthBeats = 16
+        let id = project.tracks[0].id
+        project.tracks[0].clips = [ClipModel(name: "source", assetPath: "/unused.wav", startBeat: 4,
+                                           durationBeats: 8, sourceDurationSeconds: 4)]
+        var request = GenerationRequest()
+        request.input = .trackAudio; request.referenceStartBeat = 4; request.referenceEndBeat = 8
+        request.outputEndBeat = 80
+        let plan = try GenerationOutputRange(project: project, trackID: id, request: request, playhead: 0)
+        try require(plan.startBeat == 12 && plan.endBeat == 80 && plan.seconds == 34,
+                    "reference range or timeline clamped new generation length")
+        try require(project.lengthBeats == 16 && project.tracks[0].clips.count == 1,
+                    "editing output range mutated the project before successful generation")
+        request.outputEndBeat = nil; request.bars = 2
+        let bars = try GenerationOutputRange(project: project, trackID: id, request: request, playhead: 0)
+        try require(bars.startBeat == 12 && bars.endBeat == 20, "legacy bar lengths changed")
+        request.input = .textOnly; request.outputEndBeat = 64
+        let text = try GenerationOutputRange(project: project, trackID: id, request: request, playhead: 8)
+        try require(text.startBeat == 8 && text.seconds == 28, "text generation ignored playhead/custom end")
+        for invalid in [8.0, 7.0, 8.1, Double.nan, Double.infinity, 700] {
+            request.outputEndBeat = invalid
+            do {
+                _ = try GenerationOutputRange(project: project, trackID: id, request: request, playhead: 8)
+                throw SmokeFailure("invalid AI end beat accepted")
+            } catch is MessageError {}
+        }
+        request.outputEndBeat = 608
+        let maximum = try GenerationOutputRange(project: project, trackID: id, request: request, playhead: 8)
+        try require(maximum.seconds == 300,
+                    "five-minute continuation boundary was rejected")
+        let saved = try JSONDecoder().decode(GenerationRequest.self, from: JSONEncoder().encode(request))
+        try require(saved.outputEndBeat == 608, "output end beat not saved")
+        request.outputEndBeat = nil
+        let legacy = try JSONDecoder().decode(GenerationRequest.self, from: JSONEncoder().encode(request))
+        try require(legacy.outputEndBeat == nil, "older AI settings cannot be loaded")
+        print("PASS: output-end planning beyond track/timeline, bars compatibility, validation and saved settings")
+    }
+
+    @MainActor
+    private static func assertNoteDisplay() throws {
+        let notes = [
+            MIDINote(pitch: 60, velocity: 0.8, startBeat: 1, durationBeats: 1),
+            MIDINote(pitch: 64, velocity: 0.6, startBeat: 1, durationBeats: 2),
+            MIDINote(pitch: 67, velocity: 1, startBeat: 4, durationBeats: 1)
+        ]
+        let clip = ClipModel(name: "Chord + melody", assetPath: "/unused.wav", startBeat: 8,
+                             durationBeats: 8, sourceDurationSeconds: 4, midiNotes: notes, midiSourceBPM: 120)
+        let layout = ClipNoteLayout.notes(for: clip, bpm: 120)
+        try require(layout == [DisplayNote(pitch: 60, velocity: 0.8, startSeconds: 0.5, durationSeconds: 0.5),
+                               DisplayNote(pitch: 64, velocity: 0.6, startSeconds: 0.5, durationSeconds: 1),
+                               DisplayNote(pitch: 67, velocity: 1, startSeconds: 2, durationSeconds: 0.5)],
+                    "note view stretched leading/trailing silence or lost simultaneous pitches")
+        try require(ClipNoteLayout.pitchRange(for: clip) == 60...71, "pitches are not on stable semitone rows")
+        let trimmed = try ClipEditing.trim(clip, from: 9.5, to: 13, bpm: 120)
+        let trimmedNotes = ClipNoteLayout.notes(for: trimmed, bpm: 120)
+        try require(trimmedNotes[0].startSeconds == 0 && trimmedNotes[0].durationSeconds == 0.25
+                    && trimmedNotes[1].durationSeconds == 0.75 && trimmedNotes[2].startSeconds == 1.25,
+                    "trimmed note positions do not match audio source offset")
+        let loop = ClipEditing.loop(trimmed, times: 2, bpm: 120)
+        let loopNotes = ClipNoteLayout.notes(for: loop, bpm: 120)
+        try require(loopNotes.count == 6 && loopNotes[3].startSeconds == 1.75
+                    && loopNotes[5].startSeconds == 3, "trimmed source region did not repeat on the note display")
+        let split = try ClipEditing.split(loop, at: loop.startBeat + 2, bpm: 120).1
+        let splitNotes = ClipNoteLayout.notes(for: split, bpm: 120)
+        try require(splitNotes.first?.pitch == 67 && splitNotes.first?.startSeconds == 0.25,
+                    "split display ignored the loop phase")
+        let wrapped = try ClipEditing.trim(loop, from: loop.startBeat + 2, to: loop.startBeat + 5, bpm: 120)
+        var consolidated = wrapped
+        consolidated.midiNotes = ClipNoteLayout.rebasedNotes(for: wrapped, bpm: 120)
+        consolidated.midiSourceBPM = 120
+        consolidated.sourceOffsetSeconds = 0; consolidated.playbackOffsetSeconds = 0
+        consolidated.sourceDurationSeconds = wrapped.durationBeats * 0.5
+        consolidated.loopEnabled = false; consolidated.loopLengthSeconds = nil
+        try require(ClipNoteLayout.notes(for: consolidated, bpm: 120) == ClipNoteLayout.notes(for: wrapped, bpm: 120),
+                    "consolidating a wrapped loop invalidated note metadata")
+        let shorter = ClipEditing.resize(clip, leftEdge: false, to: 11, bpm: 120)
+        try require(ClipNoteLayout.notes(for: shorter, bpm: 120).count == 2, "right resize stretched later notes into view")
+        let revealed = ClipEditing.resize(shorter, leftEdge: false, to: 16, bpm: 120)
+        try require(ClipNoteLayout.notes(for: revealed, bpm: 120) == layout, "extending edge failed to reveal original notes")
+        var faster = clip; faster.durationBeats *= 1.5
+        try require(ClipNoteLayout.notes(for: faster, bpm: 180) == layout, "tempo edit shifted notes relative to rendered audio")
+        var legacy = clip; legacy.midiSourceBPM = nil
+        let studio = StudioModel()
+        studio.project.tracks[0].clips = [legacy]
+        studio.setTempo(180)
+        let updated = studio.project.tracks[0].clips[0]
+        try require(updated.midiSourceBPM == 120 && ClipNoteLayout.notes(for: updated, bpm: 180) == layout,
+                    "legacy note tempo was not preserved on tempo edit")
+        let loaded = try JSONDecoder().decode(ClipModel.self, from: JSONEncoder().encode(legacy))
+        try require(loaded.midiSourceBPM == nil && ClipNoteLayout.notes(for: loaded, bpm: 120) == layout,
+                    "legacy project compatibility failed")
+        let saved = try JSONDecoder().decode(ClipModel.self, from: JSONEncoder().encode(updated))
+        try require(saved == updated, "source tempo not saved with the take")
+        var invalid = clip
+        invalid.midiNotes = [MIDINote(pitch: 200, velocity: 1, startBeat: 0, durationBeats: 1),
+                             MIDINote(pitch: 60, velocity: 0, startBeat: 0, durationBeats: 1)]
+        try require(ClipNoteLayout.notes(for: invalid, bpm: 120).isEmpty, "display contains inaudible/invalid MIDI events")
+        if CommandLine.arguments.contains("--note-preview") {
+            let content = VStack(alignment: .leading, spacing: 8) {
+                Text("Original · leading silence, chord, then melody").font(.caption)
+                ClipNoteView(clip: clip, bpm: 120).frame(width: 640, height: 64).background(Color.blue)
+                Text("Trimmed · partial notes at start; pitches stay on the same rows").font(.caption)
+                ClipNoteView(clip: trimmed, bpm: 120).frame(width: 280, height: 64).background(Color.purple)
+                Text("Looped trim · two identical repetitions").font(.caption)
+                ClipNoteView(clip: loop, bpm: 120).frame(width: 560, height: 64).background(Color.teal)
+            }.padding(16).background(Color(nsColor: .windowBackgroundColor))
+            let renderer = ImageRenderer(content: content)
+            renderer.scale = 2
+            guard let image = renderer.cgImage,
+                  let data = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else {
+                throw SmokeFailure("could not render note preview")
+            }
+            let previewURL = FileManager.default.temporaryDirectory.appendingPathComponent("AIMusicSketchpad-note-preview.png")
+            try data.write(to: previewURL)
+            print("NOTE PREVIEW: \(previewURL.path)")
+        }
+        print("PASS: note display timing, pitch rows, polyphony, trim/split/loop/resize, source tempo and legacy saves")
+    }
+
+    @MainActor
+    private static func assertOctaveShortcuts() throws {
+        func event(_ key: UInt16, _ characters: String, flags: NSEvent.ModifierFlags = [], repeated: Bool = false,
+                   type: NSEvent.EventType = .keyDown) -> NSEvent {
+            NSEvent.keyEvent(with: type, location: .zero, modifierFlags: flags, timestamp: 0,
+                            windowNumber: 0, context: nil, characters: characters,
+                            charactersIgnoringModifiers: characters, isARepeat: repeated, keyCode: key)!
+        }
+        let controller = RecordingController()
+        controller.source = .keyboard
+        let view = PianoKeyView()
+        view.recording = controller
+        for (offset, pair) in [(UInt16(37), "l"), (41, "ö"), (39, "ä"), (42, "#")].enumerated() {
+            let note = 13 + offset
+            try require(PianoKeyView.semitone(from: event(pair.0, pair.1)) == note, "extended keyboard mapping wrong")
+            controller.octave = 4
+            view.keyDown(with: event(pair.0, pair.1))
+            try require(view.held[pair.0] == 60 + note, "extended key did not play expected pitch")
+            controller.octave = 5
+            view.keyUp(with: event(pair.0, pair.1, type: .keyUp))
+            try require(view.held[pair.0] == nil, "extended note release lost after octave change")
+            try require(PianoKeyView.semitone(from: event(pair.0, pair.1, flags: .command)) == nil, "extended key intercepted shortcut")
+        }
+        try require(PianoKeyView.semitone(from: event(255, "Ö")) == 14, "German character mapping depended on key code")
+        for (index, key) in [UInt16(18), 19, 20, 21, 23, 22].enumerated() {
+            view.keyDown(with: event(key, String(index + 1)))
+            try require(controller.octave == index + 1, "number key did not select its octave")
+        }
+        view.keyDown(with: event(83, "1", flags: .numericPad))
+        try require(controller.octave == 1, "numeric keypad octave shortcut failed")
+        view.keyDown(with: event(22, "6", repeated: true))
+        try require(controller.octave == 1, "autorepeat changed the octave")
+        for flags: NSEvent.ModifierFlags in [.command, .control, .option] {
+            try require(PianoKeyView.octaveShortcut(from: event(18, "1", flags: flags)) == nil,
+                        "octave shortcut intercepted modified app shortcuts")
+        }
+        for characters in ["0", "7", "!", "a", "12"] {
+            try require(PianoKeyView.octaveShortcut(from: event(18, characters)) == nil, "invalid octave accepted")
+        }
+        view.keyDown(with: event(0, "a"))
+        try require(view.held[0] == 24, "wrong first-octave note")
+        view.keyDown(with: event(22, "6"))
+        try require(view.held[0] == 24, "octave change retuned a held note")
+        view.keyUp(with: event(0, "a", type: .keyUp))
+        try require(view.held.isEmpty, "octave change left a held key stuck")
+        view.keyDown(with: event(0, "a"))
+        try require(view.held[0] == 84, "new key press did not use the new octave")
+        view.releaseKeys()
+        print("PASS: 1–6/numpad octave shortcuts, modifier guards, repeat suppression, and held-note release")
+    }
+
+    private static func assertSignatureKit(kit: KeyboardInstrument = .signature) throws {
+        let started = Date()
+        let urls = kit == .signature ? try SignatureKit.sampleURLs() : []
+        for index in 0..<28 {
+            let samples = kit == .signature ? SignatureKit.synthesize(index) : AuroraKit.synthesize(index)
+            try require(samples.allSatisfy { $0.isFinite && abs($0) <= 0.651 }, "invalid synth samples")
+            try require(samples.contains { abs($0) > 0.01 }, "empty synth source")
+            if kit == .signature {
+                let cached = try completePCM(AVAudioFile(forReading: urls[index]))[0]
+                try require(cached == samples, "synth cache \(index) differs from generated PCM")
+            } else {
+                try require(samples != SignatureKit.synthesize(index), "Aurora source is a duplicate of Signature")
+            }
+        }
+        let engine = AVAudioEngine(), sampler = AVAudioUnitSampler()
+        engine.attach(sampler)
+        engine.connect(sampler, to: engine.mainMixerNode, format: nil)
+        try MIDIRenderer.loadInstrument(kit, into: sampler)
+        let instrument = sampler.auAudioUnit.fullState!["Instrument"] as! [String: Any]
+        let layers = instrument["Layers"] as! [[String: Any]]
+        let zones = layers.flatMap { $0["Zones"] as! [[String: Any]] }
+        try require(zones.count == 128 && Set(zones.compactMap { $0["min key"] as? Int }) == Set(0..<128),
+                    "Signature Kit has gaps in its MIDI map")
+        try require(layers.allSatisfy { ($0["output"] as? Int ?? 0) == 0 }, "Signature Kit has disconnected outputs")
+        var vectors: [Int: [Float]] = [:]
+        for pitch in 0..<128 {
+            let url = temporaryURL("signature-\(pitch).wav")
+            defer { try? FileManager.default.removeItem(at: url) }
+            _ = try MIDIRenderer.render(notes: [MIDINote(pitch: pitch, velocity: 0.8, startBeat: 0, durationBeats: 0.7)],
+                                       instrument: kit, bpm: 120, durationBeats: 1, sampleRate: 48_000, to: url)
+            do { try assertAudibleStereo48k(url) }
+            catch { throw SmokeFailure("Signature Kit note \(pitch): \(error)") }
+            let pcm = try completePCM(AVAudioFile(forReading: url))[0]
+            if let bad = pcm.firstIndex(where: { !$0.isFinite }) {
+                throw SmokeFailure("Signature Kit note \(pitch) invalid audio at frame \(bad), \(Double(bad) / 48_000)s")
+            }
+            if (24..<48).contains(pitch) || [48, 60, 72, 84].contains(pitch) {
+                vectors[pitch] = pcm
+            }
+        }
+        let keys = vectors.keys.sorted()
+        for (i, first) in keys.enumerated() {
+            let a = vectors[first]!, energyA = a.reduce(0.0) { $0 + Double($1) * Double($1) }
+            for second in keys.dropFirst(i + 1) {
+                let b = vectors[second]!, energyB = b.reduce(0.0) { $0 + Double($1) * Double($1) }
+                let dot = zip(a, b).reduce(0.0) { $0 + Double($1.0) * Double($1.1) }
+                let similarity = abs(dot) / sqrt(energyA * energyB)
+                try require(similarity < 0.9999, "Signature sounds \(first)/\(second): similarity \(similarity), energy \(energyA)/\(energyB), frames \(a.count)/\(b.count)")
+            }
+        }
+        for pitch in [48, 60, 84] {
+            let url = temporaryURL("signature-sustain-\(pitch).wav")
+            defer { try? FileManager.default.removeItem(at: url) }
+            // Chord source is ~7.8 seconds; holding for ten proves it really loops.
+            _ = try MIDIRenderer.render(notes: [MIDINote(pitch: pitch, velocity: 0.8, startBeat: 0, durationBeats: 20)],
+                                       instrument: kit, bpm: 120, durationBeats: 22, sampleRate: 48_000, to: url)
+            let signal = try completePCM(AVAudioFile(forReading: url))[0]
+            let heldPeak = signal[432_000..<456_000].map { abs($0) }.max()!
+            let releasedPeak = signal[504_000..<520_000].map { abs($0) }.max()!
+            try require(heldPeak > 0.001, "Signature Kit note \(pitch) stopped early: held=\(heldPeak), released=\(releasedPeak)")
+            try require(releasedPeak < 0.0001, "Signature Kit note \(pitch) stuck after release: \(releasedPeak)")
+        }
+        var project = StudioProject()
+        project.tracks[0].clips = [ClipModel(name: "Signature take", assetPath: "/test.wav", startBeat: 0,
+                                           durationBeats: 4, sourceDurationSeconds: 2, instrument: kit)]
+        let roundtrip = try JSONDecoder().decode(StudioProject.self, from: JSONEncoder().encode(project))
+        try require(roundtrip.tracks[0].clips[0].instrument == kit, "Kit identity not saved")
+        print("PASS: \(kit.rawValue), all 128 MIDI notes audible, 28 distinct sources, sustained loops, note-off, project metadata (\(Int(Date().timeIntervalSince(started)))s)")
+    }
+
+    @MainActor
+    private static func assertEditingHistory() throws {
+        let studio = StudioModel()
+        let fresh = studio.project
+        studio.addTrack()
+        let added = studio.project
+        studio.undo()
+        try require(studio.project == fresh && studio.canRedo, "add-track undo not atomic")
+        studio.redo()
+        try require(studio.project == added, "redo did not restore track")
+        studio.undo()
+        studio.project.name = "New branch"
+        try require(!studio.canRedo, "a new edit failed to clear redo")
+        studio.newProject()
+        try require(!studio.canUndo && !studio.canRedo, "new project inherited history")
+        let clip = ClipModel(name: "resize", assetPath: "/immutable.wav", startBeat: 4,
+                             durationBeats: 8, sourceDurationSeconds: 4)
+        studio.project.tracks[0].clips = [clip]
+        let original = studio.project
+        studio.selectedTrackID = original.tracks[0].id
+        studio.selectedClipID = clip.id
+        studio.resizeClip(clip.id, leftEdge: true, to: 6)
+        studio.resizeClip(clip.id, leftEdge: false, to: 9)
+        let trimmed = studio.clip(clip.id)!
+        try require(trimmed.startBeat == 6 && trimmed.endBeat == 9 && trimmed.playbackOffsetSeconds == 1, "edge trim failed")
+        studio.resizeClip(clip.id, leftEdge: false, to: 30)
+        try require(studio.clip(clip.id)!.endBeat == 12, "non-looped resize exceeds source")
+        studio.resizeClip(clip.id, leftEdge: true, to: 0)
+        try require(studio.clip(clip.id)!.startBeat == 4, "left resize did not reveal source or exceeded it")
+        studio.undo(); studio.undo(); studio.undo(); studio.undo()
+        try require(studio.project == original, "resize history does not restore exact source offsets")
+        studio.audio.playheadBeat = 8
+        studio.splitSelectedClip()
+        let split = studio.project
+        studio.undo()
+        try require(studio.project == original, "split must undo in one action")
+        studio.redo()
+        try require(studio.project == split, "split redo did not preserve clip IDs")
+        studio.undo()
+        studio.duplicateClip(clip.id)
+        studio.undo()
+        try require(studio.project == original, "duplicate undo left a clip/length change")
+        studio.beginEdit("Mix gesture")
+        for n in 0...20 { studio.project.tracks[0].effects.drive = Double(n) / 20 }
+        studio.endEdit()
+        studio.undo()
+        try require(studio.project == original, "one slider gesture created multiple undo steps")
+        studio.redo()
+        try require(studio.project.tracks[0].effects.drive == 1, "slider redo failed")
+        studio.undo()
+        studio.setAutomationPoint(trackID: original.tracks[0].id, parameter: .filterCutoff, seconds: 1, value: -0.5)
+        studio.undo()
+        try require(studio.project == original, "automation undo failed")
+        studio.selectedClipID = clip.id
+        studio.deleteSelectedClip(); studio.undo()
+        try require(studio.project == original, "deleted clip/source cannot be recovered")
+        studio.isBusy = true
+        let locked = studio.project
+        studio.undo(); studio.redo()
+        try require(studio.project == locked, "undo modified project during generation/recording")
+        studio.isBusy = false
+        var loop = clip
+        loop.loopEnabled = true
+        loop.playbackOffsetSeconds = 0.5
+        let expanded = ClipEditing.resize(loop, leftEdge: true, to: 1, bpm: 120)
+        try require(expanded.startBeat == 1 && expanded.endBeat == 12 && expanded.playbackOffsetSeconds == 3,
+                    "left extension lost wrapped loop phase")
+        let longer = ClipEditing.resize(expanded, leftEdge: false, to: 24, bpm: 120)
+        let segments = scheduledSegments(for: longer, bpm: 120, fromBeat: 0)
+        try require(longer.endBeat == 24 && abs(segments.reduce(0) { $0 + $1.durationSeconds } - 11.5) < 0.0001,
+                    "loop resizing inserted silence instead of repeats")
+        try require(ClipEditing.resize(clip, leftEdge: true, to: 99, bpm: 120).durationBeats > 0,
+                    "edge crossing inverted a clip")
+        print("PASS: undo/redo, atomic edits, slider grouping, branch invalidation, source-bounded resize and loop extension")
+    }
+
+    private static func assertExpandedEffects() throws {
+        let legacy = Data("{\"lowGain\":2,\"midGain\":0,\"highGain\":0,\"compression\":0,\"reverb\":0.2,\"delay\":0}".utf8)
+        let old = try JSONDecoder().decode(EffectSettings.self, from: legacy)
+        try require(old.drive == 0 && old.bitCrush == 0 && old.filterMode == .off && old.reverbSpace == .hall
+                    && old.lowGain == 2 && old.delayTime == 0.25, "old projects changed effect defaults")
+        let source = temporaryURL("effects-source.wav")
+        let format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 96_000)!
+        buffer.frameLength = 96_000
+        for i in 0..<96_000 {
+            let t = Double(i) / 48_000
+            let sample = Float(0.15 * (sin(2 * .pi * 120 * t) + sin(2 * .pi * 8_000 * t)))
+            for c in 0..<2 { buffer.floatChannelData![c][i] = sample }
+        }
+        try autoreleasepool { try AVAudioFile(forWriting: source, settings: format.settings).write(from: buffer) }
+        var project = StudioProject()
+        project.lengthBeats = 8
+        project.tracks = [.new(index: 0)]
+        project.tracks[0].volume = 1
+        project.tracks[0].clips = [ClipModel(name: "tone", assetPath: source.path, startBeat: 0, durationBeats: 4, sourceDurationSeconds: 2)]
+        func render(_ settings: EffectSettings, automation: [AutomationLane]? = nil) throws -> [Float] {
+            var test = project
+            test.tracks[0].effects = settings
+            test.tracks[0].automation = automation
+            let url = temporaryURL("effects-result.wav")
+            defer { try? FileManager.default.removeItem(at: url) }
+            try OfflineMixRenderer.render(project: test, to: url)
+            let pcm = try completePCM(AVAudioFile(forReading: url))[0]
+            try require(pcm.allSatisfy { $0.isFinite && abs($0) < 8 }, "effect produced invalid/extreme PCM")
+            return pcm
+        }
+        func magnitude(_ samples: [Float], frequency: Double, start: Int = 48_000) -> Double {
+            var real = 0.0, imaginary = 0.0
+            for i in start..<(start + 12_000) {
+                let phase = 2 * .pi * frequency * Double(i) / 48_000
+                real += Double(samples[i]) * cos(phase)
+                imaginary += Double(samples[i]) * sin(phase)
+            }
+            return hypot(real, imaginary) / 12_000
+        }
+        let dry = try render(EffectSettings())
+        var effect = EffectSettings()
+        effect.filterMode = .lowPass; effect.filterCutoff = 500
+        let low = try render(effect)
+        try require(magnitude(low, frequency: 8_000) < magnitude(dry, frequency: 8_000) * 0.1
+                    && magnitude(low, frequency: 120) > magnitude(dry, frequency: 120) * 0.4, "low-pass filter does not cut highs")
+        effect.filterMode = .highPass; effect.filterCutoff = 2_000
+        let high = try render(effect)
+        try require(magnitude(high, frequency: 120) < magnitude(dry, frequency: 120) * 0.1
+                    && magnitude(high, frequency: 8_000) > magnitude(dry, frequency: 8_000) * 0.4, "high-pass filter does not cut lows")
+        effect.filterMode = .bandPass; effect.filterCutoff = 1_000; effect.filterResonance = 1
+        _ = try render(effect)
+        for crush in [false, true] {
+            var settings = EffectSettings()
+            if crush { settings.bitCrush = 0.8 } else { settings.drive = 0.8 }
+            let wet = try render(settings)
+            let difference = zip(wet, dry).reduce(0.0) { $0 + abs(Double($1.0 - $1.1)) } / Double(wet.count)
+            try require(difference > 0.001, "\(crush ? "bit-crush" : "drive") has no audible effect")
+        }
+        for space in ReverbSpace.allCases {
+            var settings = EffectSettings(); settings.reverb = 0.5; settings.reverbSpace = space
+            let wet = try render(settings)
+            try require(wet[100_000..<140_000].contains { abs($0) > 0.00001 }, "\(space) has no reverb tail")
+        }
+        var delay = EffectSettings(); delay.delay = 0.7; delay.delayTime = 0.4; delay.delayFeedback = 0.4
+        let echo = try render(delay)
+        try require(echo[100_000..<115_000].contains { abs($0) > 0.001 }, "delay time/feedback has no tail")
+        var filter = EffectSettings(); filter.filterMode = .lowPass; filter.filterCutoff = 1_000
+        let sweep = AutomationLane(parameter: .filterCutoff, points: [AutomationPoint(seconds: 0, value: -0.5), AutomationPoint(seconds: 1.5, value: 0.8)])
+        let swept = try render(filter, automation: [sweep])
+        try require(magnitude(swept, frequency: 8_000, start: 72_000) > magnitude(swept, frequency: 8_000, start: 0) * 5,
+                    "cutoff automation did not sweep exported audio")
+        project.tracks[0].effects = filter; project.tracks[0].automation = [sweep]
+        let roundtrip = try JSONDecoder().decode(StudioProject.self, from: JSONEncoder().encode(project))
+        try require(roundtrip == project, "new effects/automation do not survive save/load")
+        print("PASS: legacy effects, audible drive/bit-crush/reverb/delay, LP/HP/BP filters and rendered cutoff automation")
     }
 
     private static func assertCompleteDrumKit(_ kit: KeyboardInstrument, pitches: [Int]) throws {

@@ -5,6 +5,10 @@ struct ClipContextMenu: View {
     let trackID: UUID
     let clip: ClipModel
     var body: some View {
+        if clip.notesEditable == true {
+            Button("Edit Notes…") { studio.editNotes(clip.id) }
+            Divider()
+        }
         Button("Copy Clip") { studio.copyClip(clip.id) }
         Button("Duplicate After This Clip") { studio.duplicateClip(clip.id) }
         Button("AI • Improvise from this clip…") { studio.beginGeneration(trackID: trackID, clipID: clip.id, useTrack: true) }

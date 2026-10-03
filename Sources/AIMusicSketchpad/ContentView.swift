@@ -12,8 +12,8 @@ struct ContentView: View {
                 Divider()
                 InspectorView(studio: studio)
                     .frame(width: 292)
+                    .disabled(studio.editingLocked)
             }
-            .disabled(studio.editingLocked)
             if studio.showRecordingPanel {
                 Divider()
                 RecordingPanel(studio: studio)
@@ -27,6 +27,9 @@ struct ContentView: View {
         }
         .sheet(item: Binding(get: { studio.clip(studio.trimClipID) }, set: { if $0 == nil { studio.trimClipID = nil } })) { clip in
             TrimSheet(studio: studio, clip: clip)
+        }
+        .sheet(item: Binding(get: { studio.clip(studio.noteEditClipID) }, set: { if $0 == nil { studio.noteEditClipID = nil } })) { clip in
+            NoteEditorSheet(studio: studio, clip: clip)
         }
         .alert(
             "AI Music Sketchpad",
@@ -55,6 +58,10 @@ struct ContentView: View {
             compactButton("New", systemImage: "doc.badge.plus", action: studio.newProject)
             compactButton("Open", systemImage: "folder", action: studio.openProject)
             compactButton("Save", systemImage: "square.and.arrow.down", action: studio.saveProject)
+            compactButton("Undo (⌘Z)", systemImage: "arrow.uturn.backward", action: studio.undo)
+                .disabled(!studio.canUndo)
+            compactButton("Redo (⇧⌘Z)", systemImage: "arrow.uturn.forward", action: studio.redo)
+                .disabled(!studio.canRedo)
             compactButton("Import", systemImage: "waveform.badge.plus", action: studio.importAudio)
 
             Button {
@@ -157,6 +164,9 @@ private struct TimelineEditor: View {
     @ObservedObject var studio: StudioModel
     private let headerWidth = 208.0
     @State private var beatWidth = 34.0
+    @AppStorage("timelineFollowPlayhead") private var followPlayhead = true
+    @State private var scrollPosition = ScrollPosition(x: 0)
+    @State private var viewport = TimelineViewport()
     private let rowHeight = 76.0
     private let rulerHeight = 30.0
 
@@ -166,13 +176,27 @@ private struct TimelineEditor: View {
                 HStack(alignment: .top, spacing: 0) {
                     trackHeaders
                         .frame(width: headerWidth)
+                        .disabled(studio.editingLocked)
                     Divider()
-                    ScrollViewReader { scroll in
-                        ScrollView(.horizontal) { timeline }
-                            .onChange(of: Int(studio.audio.playheadBeat / 16)) { _, page in
-                                if studio.audio.isPlaying { scroll.scrollTo("bar-\(page * 4 + 1)", anchor: .leading) }
-                            }
-                    }
+                    ScrollView(.horizontal) { timeline.disabled(studio.editingLocked) }
+                        .scrollPosition($scrollPosition)
+                        .onScrollGeometryChange(for: TimelineViewport.self) { geometry in
+                            TimelineViewport(offset: geometry.contentOffset.x, width: geometry.containerSize.width,
+                                             contentWidth: geometry.contentSize.width)
+                        } action: { old, new in
+                            viewport = new
+                            if old.width != new.width || old.contentWidth != new.contentWidth { followCursor() }
+                        }
+                        .onChange(of: studio.audio.playheadBeat) { _, _ in followCursor() }
+                        .onChange(of: studio.audio.isPlaying) { _, playing in
+                            if playing { followCursor(force: true) }
+                        }
+                        .onChange(of: followPlayhead) { _, enabled in
+                            if enabled { followCursor(force: true) }
+                        }
+                        .onChange(of: beatWidth) { _, _ in
+                            if studio.audio.isPlaying { followCursor(force: true) }
+                        }
                 }
             }
             Divider()
@@ -180,20 +204,32 @@ private struct TimelineEditor: View {
                 Button { studio.addTrack() } label: {
                     Label("Add Track", systemImage: "plus")
                 }
+                .disabled(studio.editingLocked)
                 Button(role: .destructive) { studio.deleteSelectedTrack() } label: {
                     Label("Remove", systemImage: "minus")
                 }
-                .disabled(studio.selectedTrackIndex == nil)
+                .disabled(studio.selectedTrackIndex == nil || studio.editingLocked)
                 Spacer()
+                Toggle(isOn: $followPlayhead) { Label("Follow Playhead", systemImage: "arrow.right.to.line") }
+                    .toggleStyle(.button).labelStyle(.iconOnly)
+                    .help(followPlayhead ? "Follow Playhead is on — click to scroll freely" : "Follow Playhead is off — click to follow playback")
+                    .accessibilityLabel("Follow Playhead")
                 Toggle("Snap ¼ beat", isOn: $studio.snapEnabled).toggleStyle(.checkbox)
                 Text("Zoom").font(.caption)
                 Slider(value: $beatWidth, in: 16...100).frame(width: 100)
-                Text("Drag body to move • edges to trim • ⌘C / ⌘V / ⌘D")
+                Text("Drag to move • edges resize")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }
             .padding(.horizontal, 12)
             .frame(height: 42)
+        }
+    }
+
+    private func followCursor(force: Bool = false) {
+        if let target = TimelineFollow.target(playheadX: studio.audio.playheadBeat * beatWidth,
+            viewport: viewport, enabled: followPlayhead, playing: studio.audio.isPlaying, force: force) {
+            scrollPosition.scrollTo(x: target)
         }
     }
 
@@ -279,7 +315,7 @@ private struct TimelineEditor: View {
     }
 
     private var timeline: some View {
-        let width = max(900, studio.project.lengthBeats * beatWidth)
+        let width = max(900, (studio.project.lengthBeats + 16) * beatWidth)
         return ZStack(alignment: .topLeading) {
             VStack(spacing: 0) {
                 BeatRuler(lengthBeats: studio.project.lengthBeats, beatWidth: beatWidth, bpm: studio.project.bpm)
@@ -315,6 +351,7 @@ private struct TimelineEditor: View {
                 .allowsHitTesting(false)
         }
         .frame(width: width, alignment: .leading)
+        .coordinateSpace(name: "timeline")
     }
 
     private func miniToggle(_ title: String, isOn: Bool, action: @escaping () -> Void) -> some View {
@@ -415,9 +452,17 @@ private struct TimelineClip: View {
     let beatWidth: Double
     let height: Double
     @GestureState private var dragOffset = CGSize.zero
+    private struct ResizeDrag: Equatable { var left: Bool; var delta: Double }
+    @GestureState private var resizeDrag: ResizeDrag?
+    private var preview: ClipModel {
+        guard let resizeDrag else { return clip }
+        let edge = resizeDrag.left ? clip.startBeat : clip.endBeat
+        return ClipEditing.resize(clip, leftEdge: resizeDrag.left,
+                                  to: studio.snappedBeat(edge + resizeDrag.delta / beatWidth), bpm: studio.project.bpm)
+    }
 
     var body: some View {
-        let width = max(34, clip.durationBeats * beatWidth)
+        let width = max(18, preview.durationBeats * beatWidth)
         ZStack(alignment: .topLeading) {
             RoundedRectangle(cornerRadius: 7)
                 .fill(
@@ -432,18 +477,21 @@ private struct TimelineClip: View {
                     studio.selectedClipID == clip.id ? Color.white : color.opacity(0.8),
                     lineWidth: studio.selectedClipID == clip.id ? 2 : 1
                 )
-            if let notes = clip.midiNotes {
-                MiniPianoRoll(notes: notes)
-                    .padding(.top, 20)
-                    .opacity(0.7)
-            } else {
-                AudioWaveform(clip: clip, bpm: studio.project.bpm)
-                    .padding(.horizontal, 8)
-                    .padding(.top, 18)
-                    .padding(.bottom, 5)
+            Group {
+                if preview.midiNotes != nil {
+                    ClipNoteView(clip: preview, bpm: studio.project.bpm)
+                } else {
+                    AudioWaveform(clip: preview, bpm: studio.project.bpm)
+                }
             }
+            // No horizontal inset: source time zero must align with the clip edge.
+            .padding(.top, 18)
+            .padding(.bottom, 5)
+            .frame(width: preview.durationBeats * beatWidth)
+            .clipped()
             HStack(spacing: 4) {
                 if clip.generatedPart != nil { Image(systemName: "sparkles") }
+                else if clip.midiNotes != nil { Image(systemName: "pianokeys") }
                 Text(clip.name).lineLimit(1)
                 if clip.loopEnabled { Image(systemName: "repeat") }
             }
@@ -455,7 +503,7 @@ private struct TimelineClip: View {
         .frame(width: width, height: height)
         .contentShape(Rectangle())
         .gesture(
-            DragGesture(minimumDistance: 3)
+            DragGesture(minimumDistance: 3, coordinateSpace: .named("timeline"))
                 .updating($dragOffset) { value, state, _ in state = value.translation }
                 .onChanged { _ in
                     if studio.draggingClipID != clip.id {
@@ -472,11 +520,15 @@ private struct TimelineClip: View {
                     )
                 }
         )
+        .onTapGesture(count: 2) {
+            studio.selectClip(trackID: trackID, clipID: clip.id)
+            studio.editNotes(clip.id)
+        }
         .onTapGesture { studio.selectClip(trackID: trackID, clipID: clip.id) }
         .contextMenu { ClipContextMenu(studio: studio, trackID: trackID, clip: clip) }
         .overlay(alignment: .leading) { trimHandle(left: true) }
         .overlay(alignment: .trailing) { trimHandle(left: false) }
-        .offset(x: max(0, studio.snappedBeat(clip.startBeat + dragOffset.width / beatWidth)) * beatWidth, y: dragOffset.height)
+        .offset(x: (dragOffset == .zero ? preview.startBeat : max(0, studio.snappedBeat(clip.startBeat + dragOffset.width / beatWidth))) * beatWidth, y: dragOffset.height)
         .zIndex(studio.draggingClipID == clip.id ? 10 : 0)
         .onChange(of: dragOffset) { _, offset in
             if offset == .zero, studio.draggingClipID == clip.id { studio.draggingClipID = nil }
@@ -486,40 +538,21 @@ private struct TimelineClip: View {
 
     private func trimHandle(left: Bool) -> some View {
         RoundedRectangle(cornerRadius: 2)
-            .fill(Color.white.opacity(studio.selectedClipID == clip.id ? 0.8 : 0.25))
-            .frame(width: 5, height: 26)
-            .padding(.horizontal, 4)
+            .fill(Color.white.opacity(studio.selectedClipID == clip.id ? 0.9 : 0.45))
+            .frame(width: 4, height: 30)
+            .frame(width: min(16, max(18, preview.durationBeats * beatWidth) / 3), height: height)
             .contentShape(Rectangle())
-            .highPriorityGesture(DragGesture(minimumDistance: 3).onEnded { value in
-                let delta = studio.snappedBeat(value.translation.width / beatWidth)
-                let start = left ? min(clip.endBeat - 0.25, max(clip.startBeat, clip.startBeat + delta)) : clip.startBeat
-                let end = left ? clip.endBeat : max(clip.startBeat + 0.25, min(clip.endBeat, clip.endBeat + delta))
-                studio.trimClip(clip.id, from: start, to: end)
-            })
-            .help(left ? "Drag right to trim start" : "Drag left to trim end")
-    }
-}
-
-private struct MiniPianoRoll: View {
-    let notes: [MIDINote]
-
-    var body: some View {
-        Canvas { context, size in
-            guard let minPitch = notes.map(\.pitch).min(),
-                  let maxPitch = notes.map(\.pitch).max(),
-                  let maxBeat = notes.map({ $0.startBeat + $0.durationBeats }).max(),
-                  maxBeat > 0 else { return }
-            let range = max(1, maxPitch - minPitch + 1)
-            for note in notes {
-                let rect = CGRect(
-                    x: note.startBeat / maxBeat * size.width,
-                    y: size.height - Double(note.pitch - minPitch + 1) / Double(range) * size.height,
-                    width: max(1, note.durationBeats / maxBeat * size.width),
-                    height: max(1.5, size.height / Double(range) * 0.7)
-                )
-                context.fill(Path(roundedRect: rect, cornerRadius: 1), with: .color(.white.opacity(0.8)))
+            .onHover { inside in
+                if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
             }
-        }
+            .highPriorityGesture(DragGesture(minimumDistance: 2, coordinateSpace: .named("timeline"))
+                .updating($resizeDrag) { value, state, _ in state = ResizeDrag(left: left, delta: value.translation.width) }
+                .onChanged { _ in studio.selectClip(trackID: trackID, clipID: clip.id) }
+                .onEnded { value in
+                    studio.resizeClip(clip.id, leftEdge: left,
+                                      to: (left ? clip.startBeat : clip.endBeat) + value.translation.width / beatWidth)
+                })
+            .help(clip.loopEnabled ? "Drag to shorten or extend repetitions" : "Drag to trim or reveal source audio. Enable looping to repeat beyond the source.")
     }
 }
 
@@ -566,8 +599,36 @@ private struct InspectorView: View {
             inspectorSlider("Mid EQ", value: $studio.project.tracks[index].effects.midGain, range: -18...18, suffix: " dB")
             inspectorSlider("High EQ", value: $studio.project.tracks[index].effects.highGain, range: -18...18, suffix: " dB")
             inspectorSlider("Compression", value: $studio.project.tracks[index].effects.compression, range: 0...1)
+            inspectorSlider("Drive", value: $studio.project.tracks[index].effects.drive, range: 0...1)
+            inspectorSlider("Bit-crush", value: $studio.project.tracks[index].effects.bitCrush, range: 0...1)
+            Picker("Reverb space", selection: $studio.project.tracks[index].effects.reverbSpace) {
+                ForEach(ReverbSpace.allCases) { Text($0.rawValue).tag($0) }
+            }
             inspectorSlider("Reverb", value: $studio.project.tracks[index].effects.reverb, range: 0...1)
             inspectorSlider("Delay", value: $studio.project.tracks[index].effects.delay, range: 0...1)
+            inspectorSlider("Delay time", value: $studio.project.tracks[index].effects.delayTime, range: 0.01...2, suffix: " s")
+            inspectorSlider("Delay feedback", value: $studio.project.tracks[index].effects.delayFeedback, range: 0...0.85)
+
+            Text("FILTER").font(.caption2.weight(.bold)).foregroundStyle(.secondary)
+            Picker("Type", selection: $studio.project.tracks[index].effects.filterMode) {
+                ForEach(FilterMode.allCases) { Text($0.rawValue).tag($0) }
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Cutoff • \(studio.project.tracks[index].effects.filterCutoff, specifier: "%.0f") Hz").font(.caption)
+                Slider(value: Binding(get: { log2(max(20, studio.project.tracks[index].effects.filterCutoff)) },
+                                      set: { studio.project.tracks[index].effects.filterCutoff = pow(2, $0) }),
+                       in: log2(20)...log2(20_000), onEditingChanged: { editing in
+                    if editing { studio.beginEdit("Filter Cutoff") } else { studio.endEdit() }
+                })
+            }
+            .disabled(studio.project.tracks[index].effects.filterMode == .off)
+            inspectorSlider("Resonance", value: $studio.project.tracks[index].effects.filterResonance, range: 0...1)
+                .disabled(studio.project.tracks[index].effects.filterMode == .off)
+            Button("Automate filter cutoff") {
+                studio.visibleAutomation[studio.project.tracks[index].id] = .filterCutoff
+            }
+            Text("Automation zero keeps these base settings. Enable a filter type to hear its cutoff curve.")
+                .font(.caption2).foregroundStyle(.secondary)
         }
     }
 
@@ -618,7 +679,9 @@ private struct InspectorView: View {
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-            Slider(value: value, in: range)
+            Slider(value: value, in: range, onEditingChanged: { editing in
+                if editing { studio.beginEdit(title) } else { studio.endEdit() }
+            })
         }
     }
 
@@ -635,7 +698,21 @@ private struct GenerationSheet: View {
     @ObservedObject var studio: StudioModel
     @Environment(\.dismiss) private var dismiss
 
-    private var audioSeconds: Double { Double(studio.generationRequest.bars * 4) * 60 / studio.project.bpm }
+    private var outputStart: Double {
+        guard let id = studio.generationTrack?.id else { return 0 }
+        return GenerationOutputRange.start(project: studio.project, trackID: id, request: studio.generationRequest,
+                                           playhead: studio.snappedBeat(studio.audio.currentBeat))
+    }
+    private var outputEnd: Double { studio.generationRequest.outputEndBeat ?? (outputStart + Double(studio.generationRequest.bars) * 4) }
+    private var audioSeconds: Double { (outputEnd - outputStart) * 60 / studio.project.bpm }
+    private var outputError: String? {
+        guard let id = studio.generationTrack?.id else { return "Select a track first." }
+        do {
+            _ = try GenerationOutputRange(project: studio.project, trackID: id, request: studio.generationRequest,
+                                           playhead: studio.snappedBeat(studio.audio.currentBeat))
+            return nil
+        } catch { return error.localizedDescription }
+    }
     private var isReference: Bool { studio.generationRequest.input == .trackAudio }
     private var referenceSeconds: Double { isReference ? (studio.generationRequest.referenceEndBeat - studio.generationRequest.referenceStartBeat) * 60 / studio.project.bpm : 0 }
     private var validReference: Bool {
@@ -685,9 +762,10 @@ private struct GenerationSheet: View {
                     }
                 }
                 if isReference {
+                    Text("AI INPUT • existing music to learn from").font(.caption2.bold()).foregroundStyle(.secondary)
                     HStack {
-                        TextField("From beat", value: $studio.generationRequest.referenceStartBeat, format: .number.precision(.fractionLength(2)))
-                        TextField("To beat", value: $studio.generationRequest.referenceEndBeat, format: .number.precision(.fractionLength(2)))
+                        TextField("Reference from beat", value: $studio.generationRequest.referenceStartBeat, format: .number.precision(.fractionLength(2)))
+                        TextField("Reference to beat", value: $studio.generationRequest.referenceEndBeat, format: .number.precision(.fractionLength(2)))
                         Button("Use ending") { studio.resetReferenceRange() }
                     }
                     Text("Reference: \(referenceSeconds, specifier: "%.2f") seconds (0.25–12). MIDI is heard through its recorded instrument; other tracks are excluded.")
@@ -705,12 +783,28 @@ private struct GenerationSheet: View {
                     }
                 }
                 }
-                Stepper("Bars: \(studio.generationRequest.bars)", value: $studio.generationRequest.bars, in: 1...32)
+                Stepper("Bars: \(studio.generationRequest.bars)\(studio.generationRequest.outputEndBeat == nil ? "" : " (preset)")",
+                        value: Binding(get: { studio.generationRequest.bars }, set: {
+                            studio.generationRequest.bars = $0; studio.generationRequest.outputEndBeat = nil
+                        }), in: 1...32)
                 TextField("Key", text: $studio.generationRequest.key)
                 if studio.generationRequest.engine == .audio {
-                    Text("New audio: \(audioSeconds, specifier: "%.1f") s • input + new audio: \(audioSeconds + referenceSeconds, specifier: "%.1f") / 29 s")
+                    Text("AI OUTPUT • new music to add").font(.caption2.bold()).foregroundStyle(.secondary)
+                    Text("Starts at beat \(outputStart, specifier: "%.2f")\(isReference ? " • after the last clip" : " • at the playhead")")
                         .font(.caption)
-                        .foregroundStyle(audioSeconds + referenceSeconds > 29 ? Color.red : Color.secondary)
+                    HStack {
+                        TextField("Generate through beat", value: Binding(get: { outputEnd }, set: { studio.generationRequest.outputEndBeat = $0 }),
+                                  format: .number.precision(.fractionLength(2)))
+                        Button("Use bars") { studio.generationRequest.outputEndBeat = nil }
+                    }
+                    if let outputError {
+                        Text(outputError).font(.caption).foregroundStyle(.red)
+                    } else {
+                        Text("New music: \(audioSeconds, specifier: "%.1f") s. \(outputEnd > studio.project.lengthBeats ? "The timeline will extend to fit." : "Existing clips stay intact.")")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Text("Up to 5 minutes of new audio. Longer requests use connected continuation sections and take more time. Cancel leaves your track unchanged.")
+                        .font(.caption2).foregroundStyle(.secondary)
                     HStack {
                         TextField("Seed", value: $studio.generationRequest.seed, format: .number.grouping(.never))
                         Button("Randomize") { studio.generationRequest.seed = Int.random(in: 1...999_999) }
@@ -737,7 +831,7 @@ private struct GenerationSheet: View {
                 HStack(alignment: .top) {
                     Image(systemName: generatorReady ? "checkmark.circle.fill" : "cpu")
                         .foregroundStyle(generatorReady ? Color.green : Color.secondary)
-                    Text(isReference ? "MusicGen hears this track and improvises a continuation guided by your prompt. It does not repair or faithfully rewrite the original take. Only NEW audio is appended after this track's last clip. 32 kHz mono • model license: noncommercial." : generatorDetail)
+                    Text(isReference ? "MusicGen hears the reference and generates NEW music from the last clip through your chosen output end beat, extending the timeline as needed. It does not replace existing clips. Longer continuations can drift in style or tempo. 32 kHz mono • model license: noncommercial." : generatorDetail)
                     .font(.caption)
                 }
             }
@@ -749,16 +843,18 @@ private struct GenerationSheet: View {
                     .buttonStyle(.borderedProminent)
                     .tint(.purple)
                     .disabled(studio.generationRequest.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    .disabled(studio.generationRequest.engine == .audio && (!generatorReady || !validReference || audioSeconds < 1 || audioSeconds + referenceSeconds > 29))
+                    .disabled(studio.generationRequest.engine == .audio && (!generatorReady || !validReference || outputError != nil))
             }
         }
         .padding(24)
         .frame(width: 680, height: 740)
         .onAppear { if studio.generationRequest.engine == .localNotes { studio.refreshModels() } }
         .onChange(of: studio.generationRequest.engine) { _, engine in
+            if engine != .audio { studio.generationRequest.outputEndBeat = nil }
             if engine == .localNotes { studio.refreshModels() }
         }
         .onChange(of: studio.generationRequest.input) { _, input in
+            studio.generationRequest.outputEndBeat = nil
             if input == .trackAudio { studio.generationRequest.engine = .audio; studio.resetReferenceRange() }
         }
         .onDisappear { studio.rememberGenerationSettings() }

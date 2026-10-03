@@ -9,9 +9,12 @@ let package = Package(
         .executable(name: "AIMusicSketchpad", targets: ["AIMusicSketchpad"])
     ],
     targets: [
+        .target(name: "SketchSynthDSP", publicHeadersPath: "include"),
         .executableTarget(
             name: "AIMusicSketchpad",
+            dependencies: ["SketchSynthDSP"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         )
-    ]
+    ],
+    cxxLanguageStandard: .cxx17
 )
