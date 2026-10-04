@@ -218,7 +218,7 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
         guard !isRecording, let unit = hostedInstrument?.unit, configuration.mode == .audioUnit else { return }
         let controller = await InstrumentEditorWindow.controller(for: unit)
         guard hostedInstrument?.unit === unit else { return }
-        if let controller { editorWindow.show(controller, title: configuration.name) }
+        if let controller { editorWindow.show(controller, title: configuration.name, recording: self) }
         else { throw MessageError("This plug-in does not provide a custom window. Use its parameters and factory presets below.") }
     }
     func closePluginEditor() { editorWindow.close() }

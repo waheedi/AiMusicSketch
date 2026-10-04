@@ -7,6 +7,44 @@ import SwiftUI
 
 @main
 struct SmokeTest {
+    @MainActor private static func assertUsability() throws {
+        let studio = StudioModel()
+        for _ in 0..<36 { studio.addTrack() }
+        try require(studio.project.tracks.count == 40 && studio.alertMessage == nil, "Tracks still capped at eight")
+        studio.undo()
+        try require(studio.project.tracks.count == 39, "Add-track undo failed")
+        studio.redo()
+        try require(studio.project.tracks.count == 40, "Add-track redo failed")
+        let restored = try JSONDecoder().decode(StudioProject.self, from: JSONEncoder().encode(studio.project))
+        try require(restored.tracks == studio.project.tracks, "Large project lost tracks on JSON round-trip")
+        studio.zoomTimeline(inward: true)
+        try require(studio.timelineBeatWidth == 42.5, "Zoom-in step")
+        studio.zoomTimeline(inward: false)
+        try require(studio.timelineBeatWidth == 34, "Zoom-out step")
+        for _ in 0..<100 { studio.zoomTimeline(inward: true) }
+        try require(studio.timelineBeatWidth == 160, "Zoom maximum")
+        for _ in 0..<100 { studio.zoomTimeline(inward: false) }
+        try require(studio.timelineBeatWidth == 8, "Zoom minimum")
+        func action(_ characters: String, _ modifiers: NSEvent.ModifierFlags = []) -> StudioKeyAction? {
+            let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: modifiers,
+                timestamp: 0, windowNumber: 0, context: nil, characters: characters,
+                charactersIgnoringModifiers: characters, isARepeat: false, keyCode: 15)!
+            return StudioKeyAction.action(for: event)
+        }
+        try require(action("r") == .record && action("R", .capsLock) == .record, "R record shortcut")
+        try require(action("r", .command) == nil && action("r", .option) == nil && action("r", .shift) == nil,
+                    "Modified R should pass through")
+        try require(action("+", .command) == .zoomIn && action("=", .command) == .zoomIn &&
+                    action("+", [.command, .shift]) == .zoomIn && action("-", .command) == .zoomOut,
+                    "Zoom keyboard layouts")
+        try require(action("+") == nil && action("-", [.command, .option]) == nil && action("a") == nil,
+                    "Unrelated keys intercepted")
+        studio.isBusy = true
+        studio.toggleRecording()
+        try require(!studio.recording.isRecording && !studio.canToggleRecording, "Record busy guard")
+        print("PASS: 40 tracks, undo/redo, large-project JSON, zoom range and R/zoom shortcut mapping")
+    }
+
     static func main() async {
         do {
             try await run()
@@ -19,6 +57,7 @@ struct SmokeTest {
 
     @MainActor
     private static func run() async throws {
+        try assertUsability()
         try await InstrumentTests.run()
         try assertOctaveShortcuts()
         try assertGenerationOutputRange()

@@ -130,8 +130,6 @@ struct TrackModel: Codable, Identifiable, Hashable {
 }
 
 struct StudioProject: Codable, Hashable {
-    static let maximumTrackCount = 8
-
     var id = UUID()
     var name = "Untitled Sketch"
     var bpm = 120.0
@@ -237,7 +235,6 @@ struct MessageError: LocalizedError {
 }
 
 enum StudioError: LocalizedError {
-    case trackLimit
     case noTrackSelected
     case noClipSelected
     case invalidAudio
@@ -246,7 +243,6 @@ enum StudioError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .trackLimit: "The project supports up to eight tracks."
         case .noTrackSelected: "Select a track first."
         case .noClipSelected: "Select a clip first."
         case .invalidAudio: "The selected audio file could not be imported."

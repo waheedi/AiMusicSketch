@@ -15,16 +15,14 @@ struct RecordingPanel: View {
                 .frame(width: 290)
                 .disabled(studio.editingLocked)
                 Spacer()
-                Button {
-                    if studio.recording.isRecording { studio.stop() }
-                    else { studio.startRecording() }
-                } label: {
+                Button(action: studio.toggleRecording) {
                     Label(studio.recording.isRecording ? "Stop & Save Take" : "Record Track",
                           systemImage: studio.recording.isRecording ? "stop.fill" : "record.circle.fill")
                 }
                 .tint(.red)
                 .buttonStyle(.borderedProminent)
-                .disabled(studio.isBusy || studio.recording.isLoadingInstrument)
+                .disabled(!studio.canToggleRecording)
+                .help("R: record / stop and save take")
                 Button {
                     studio.recording.panic()
                     studio.showRecordingPanel = false

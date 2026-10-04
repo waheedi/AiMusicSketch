@@ -12,6 +12,7 @@ swiftc -parse-as-library \
     Sources/AIMusicSketchpad/InstrumentAudioCapture.swift \
     Sources/AIMusicSketchpad/InstrumentControls.swift \
     Sources/AIMusicSketchpad/TimelineFollow.swift \
+    Sources/AIMusicSketchpad/StudioShortcuts.swift \
     Sources/AIMusicSketchpad/Models.swift \
     Sources/AIMusicSketchpad/GenerationOutputRange.swift \
     Sources/AIMusicSketchpad/Automation.swift \

@@ -39,6 +39,7 @@ final class StudioModel: ObservableObject {
     @Published var generationTrackID: UUID?
     @Published var visibleAutomation: [UUID: AutomationParameter] = [:]
     @Published var snapEnabled = true
+    @Published var timelineBeatWidth = 34.0
     @Published var draggingClipID: UUID?
     private(set) var copiedClip: ClipModel?
     @Published var availableModels: [String] = []
@@ -52,6 +53,17 @@ final class StudioModel: ObservableObject {
     private var recordingStartBeat = 0.0
     private var recordingBPM = 120.0
     var editingLocked: Bool { isBusy || recording.isRecording || recording.isLoadingInstrument }
+    var canToggleRecording: Bool { !isBusy && !recording.isLoadingInstrument && selectedTrackIndex != nil }
+
+    func zoomTimeline(inward: Bool) {
+        timelineBeatWidth = min(160, max(8, timelineBeatWidth * (inward ? 1.25 : 0.8)))
+    }
+
+    func toggleRecording() {
+        guard canToggleRecording else { return }
+        if recording.isRecording { stop() }
+        else { startRecording() }
+    }
 
     init() {
         selectedTrackID = project.tracks.first?.id
@@ -202,7 +214,6 @@ final class StudioModel: ObservableObject {
 
     func addTrack() {
         guard !editingLocked else { return }
-        guard project.tracks.count < StudioProject.maximumTrackCount else { present(StudioError.trackLimit); return }
         beginEdit("Add Track"); defer { endEdit() }
         let track = TrackModel.new(index: project.tracks.count)
         project.tracks.append(track)
@@ -260,7 +271,7 @@ final class StudioModel: ObservableObject {
                 guard var index = project.tracks.firstIndex(where: { $0.id == target }) else { return }
                 beginEdit("Import Audio"); defer { endEdit() }
                 for (n, entry) in clips.enumerated() {
-                    if n > 0 && project.tracks.count < StudioProject.maximumTrackCount {
+                    if n > 0 {
                         project.tracks.append(.new(index: project.tracks.count))
                         index = project.tracks.count - 1
                     }
@@ -657,7 +668,6 @@ final class StudioModel: ObservableObject {
                       ($0.midiSourceBPM == nil || ($0.midiSourceBPM!.isFinite && $0.midiSourceBPM! > 0)) &&
                       ($0.loopLengthSeconds ?? 1).isFinite && ($0.loopLengthSeconds ?? 1) > 0
                   }) else { throw MessageError("This project contains invalid timing or audio settings.") }
-            opened.tracks = Array(opened.tracks.prefix(StudioProject.maximumTrackCount))
             if opened.tracks.isEmpty { opened.tracks.append(.new(index: 0)) }
             audio.stop(resetPlayhead: true)
             suppressInstrumentStore = true
@@ -718,12 +728,12 @@ final class StudioModel: ObservableObject {
             else if let index = next.tracks.indices.first(where: { next.tracks[$0].clips.isEmpty && !destinations.contains($0) }) {
                 next.tracks[index].name = part.title
                 destinations.append(index)
-            } else if next.tracks.count < StudioProject.maximumTrackCount {
+            } else {
                 var track = TrackModel.new(index: next.tracks.count)
                 track.name = part.title
                 destinations.append(next.tracks.count)
                 next.tracks.append(track)
-            } else { present(StudioError.trackLimit); return }
+            }
         }
         let start = snappedBeat(audio.currentBeat)
         audio.stop()

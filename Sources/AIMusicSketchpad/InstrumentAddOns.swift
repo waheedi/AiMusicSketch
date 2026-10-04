@@ -245,9 +245,69 @@ final class HostedInstrument {
 }
 
 @MainActor
-final class InstrumentEditorWindow {
+final class InstrumentEditorWindow: NSObject, NSWindowDelegate {
     private var window: NSWindow?
-    func close() { window?.close(); window = nil }
+    private weak var recording: RecordingController?
+    private var keyMonitor: Any?
+    private var heldKeys: [UInt16: Int] = [:]
+    private var computerKeys: NSButton?
+    var acceptsComputerShortcuts: Bool { computerKeys?.state == .on }
+
+    func close() { stopKeyboard(); window?.close(); window = nil }
+
+    private func releaseKeys() {
+        for pitch in heldKeys.values { recording?.noteOff(pitch) }
+        heldKeys.removeAll()
+    }
+
+    private func stopKeyboard() {
+        releaseKeys()
+        if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
+        keyMonitor = nil
+        NotificationCenter.default.removeObserver(self, name: NSApplication.didResignActiveNotification, object: nil)
+        computerKeys = nil
+        recording = nil
+    }
+
+    func windowWillClose(_ notification: Notification) { stopKeyboard(); window = nil }
+    func windowDidResignKey(_ notification: Notification) { releaseKeys() }
+    @objc private func applicationDeactivated(_ notification: Notification) { releaseKeys() }
+    @objc private func toggleComputerKeys(_ sender: NSButton) { releaseKeys() }
+
+    static func isEditingText(in window: NSWindow) -> Bool {
+        if let text = window.firstResponder as? NSTextView, text.isEditable { return true }
+        // JUCE (including Surge) exposes its custom text editors through accessibility,
+        // even though its first responder is a single native view for the entire synth.
+        let focused = window.firstResponder?.accessibilityFocusedUIElement as? NSAccessibilityProtocol
+        guard let role = focused?.accessibilityRole() else { return false }
+        return [NSAccessibility.Role.textField, .textArea, .comboBox].contains(role)
+    }
+
+    func handleKeyEvent(_ event: NSEvent) -> NSEvent? {
+        // Release the original pitch even if the octave, modifiers or focus changed.
+        if event.type == .keyUp, let pitch = heldKeys.removeValue(forKey: event.keyCode) {
+            recording?.noteOff(pitch)
+            return nil
+        }
+        guard event.type == .keyDown, let window, event.window === window, window.isKeyWindow,
+              window.attachedSheet == nil, NSApp.modalWindow == nil,
+              computerKeys?.state == .on, let recording, recording.source == .keyboard,
+              !recording.isLoadingInstrument, recording.hostedInstrument != nil else { return event }
+        if Self.isEditingText(in: window) { releaseKeys(); return event }
+        guard event.modifierFlags.intersection([.command, .control, .option]).isEmpty else { return event }
+        if event.keyCode == 53 { heldKeys.removeAll(); recording.panic(); return nil }
+        if let octave = PianoKeyView.octaveShortcut(from: event) {
+            if !event.isARepeat { recording.octave = octave }
+            return nil
+        }
+        guard let semitone = PianoKeyView.semitone(from: event) else { return event }
+        guard !event.isARepeat, heldKeys[event.keyCode] == nil else { return nil }
+        let pitch = (recording.octave + 1) * 12 + semitone
+        guard (0..<128).contains(pitch) else { return event }
+        heldKeys[event.keyCode] = pitch
+        recording.noteOn(pitch)
+        return nil
+    }
     static func controller(for unit: AVAudioUnit) async -> NSViewController? {
         if let controller = await unit.auAudioUnit.requestViewController() { return controller }
         // AUv2 instruments can publish a Cocoa view factory instead of an AUv3 controller.
@@ -272,15 +332,39 @@ final class InstrumentEditorWindow {
         }
         return nil
     }
-    func show(_ controller: NSViewController, title: String) {
+    func show(_ controller: NSViewController, title: String, recording: RecordingController) {
         close()
+        self.recording = recording
         let window = NSWindow(contentViewController: controller)
         window.title = title
         window.styleMask.insert([.titled, .closable, .resizable])
         window.isReleasedWhenClosed = false
         window.setContentSize(NSSize(width: max(480, controller.view.frame.width, controller.view.fittingSize.width),
                                      height: max(320, controller.view.frame.height, controller.view.fittingSize.height)))
-        window.center(); window.makeKeyAndOrderFront(nil)
+        let toggle = NSButton(checkboxWithTitle: "Computer Keys", target: self, action: #selector(toggleComputerKeys(_:)))
+        toggle.state = .on
+        toggle.toolTip = "Play the Sketchpad piano while this window is focused. Turn off to use the plug-in's own letter shortcuts."
+        let hint = NSTextField(labelWithString: "1–6 octave · Esc release · Text fields stay editable")
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+        hint.lineBreakMode = .byTruncatingTail
+        let bar = NSStackView(views: [toggle, hint])
+        bar.spacing = 12
+        bar.edgeInsets = NSEdgeInsets(top: 4, left: 10, bottom: 4, right: 10)
+        bar.frame = NSRect(x: 0, y: 0, width: window.frame.width, height: 30)
+        let accessory = NSTitlebarAccessoryViewController()
+        accessory.view = bar
+        accessory.layoutAttribute = .bottom
+        window.addTitlebarAccessoryViewController(accessory)
+        computerKeys = toggle
         self.window = window
+        window.delegate = self
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
+            guard let self else { return event }
+            return self.handleKeyEvent(event)
+        }
+        NotificationCenter.default.addObserver(self, selector: #selector(applicationDeactivated(_:)),
+                                               name: NSApplication.didResignActiveNotification, object: nil)
+        window.center(); window.makeKeyAndOrderFront(nil)
     }
 }

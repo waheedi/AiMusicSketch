@@ -22,6 +22,7 @@ struct ContentView: View {
             statusBar
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .background(StudioShortcuts(studio: studio).frame(width: 0, height: 0))
         .sheet(isPresented: $studio.showGenerateSheet) {
             GenerationSheet(studio: studio)
         }
@@ -73,9 +74,15 @@ struct ContentView: View {
             .tint(.purple)
             .disabled(studio.editingLocked)
 
-            Button { studio.showRecordingPanel.toggle() } label: {
-                Label("Record", systemImage: "mic")
+            Button(action: studio.toggleRecording) {
+                Label(studio.recording.isRecording ? "Stop & Save" : "Record",
+                      systemImage: studio.recording.isRecording ? "stop.fill" : "record.circle.fill")
             }
+            .buttonStyle(.borderedProminent)
+            .tint(.red)
+            .disabled(!studio.canToggleRecording)
+            .help("R: record / stop and save take")
+            compactButton("Recording Controls (⇧⌘R)", systemImage: "pianokeys") { studio.showRecordingPanel.toggle() }
             .disabled(studio.recording.isRecording)
 
             Spacer(minLength: 8)
@@ -136,7 +143,7 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
             if studio.isGenerating { Button("Cancel", action: studio.cancelGeneration).controlSize(.small) }
             Spacer()
-            Text("\(studio.project.tracks.count)/\(StudioProject.maximumTrackCount) tracks")
+            Text("\(studio.project.tracks.count) tracks")
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.tertiary)
         }
@@ -163,7 +170,8 @@ struct ContentView: View {
 private struct TimelineEditor: View {
     @ObservedObject var studio: StudioModel
     private let headerWidth = 208.0
-    @State private var beatWidth = 34.0
+    private var beatWidth: Double { studio.timelineBeatWidth }
+    private var timelineWidth: Double { max(900, (studio.project.lengthBeats + 16) * beatWidth) }
     @AppStorage("timelineFollowPlayhead") private var followPlayhead = true
     @State private var scrollPosition = ScrollPosition(x: 0)
     @State private var viewport = TimelineViewport()
@@ -172,6 +180,9 @@ private struct TimelineEditor: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            pinnedRuler
+            Divider()
+            ScrollViewReader { verticalScroll in
             ScrollView(.vertical) {
                 HStack(alignment: .top, spacing: 0) {
                     trackHeaders
@@ -194,10 +205,16 @@ private struct TimelineEditor: View {
                         .onChange(of: followPlayhead) { _, enabled in
                             if enabled { followCursor(force: true) }
                         }
-                        .onChange(of: beatWidth) { _, _ in
-                            if studio.audio.isPlaying { followCursor(force: true) }
+                        .onChange(of: beatWidth) { old, new in
+                            // Keep the same left-edge beat when zooming a scrolled timeline.
+                            scrollPosition.scrollTo(x: max(0, viewport.offset / old * new))
+                            if studio.audio.isPlaying && followPlayhead { followCursor(force: true) }
                         }
                 }
+            }
+            .onChange(of: studio.project.tracks.count) { old, new in
+                if new > old, let id = studio.selectedTrackID { verticalScroll.scrollTo(id, anchor: .bottom) }
+            }
             }
             Divider()
             HStack {
@@ -216,7 +233,11 @@ private struct TimelineEditor: View {
                     .accessibilityLabel("Follow Playhead")
                 Toggle("Snap ¼ beat", isOn: $studio.snapEnabled).toggleStyle(.checkbox)
                 Text("Zoom").font(.caption)
-                Slider(value: $beatWidth, in: 16...100).frame(width: 100)
+                Button { studio.zoomTimeline(inward: false) } label: { Image(systemName: "minus.magnifyingglass") }
+                    .help("Zoom out (⌘−)")
+                Slider(value: $studio.timelineBeatWidth, in: 8...160).frame(width: 90)
+                Button { studio.zoomTimeline(inward: true) } label: { Image(systemName: "plus.magnifyingglass") }
+                    .help("Zoom in (⌘+ or ⌘=)")
                 Text("Drag to move • edges resize")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
@@ -233,8 +254,8 @@ private struct TimelineEditor: View {
         }
     }
 
-    private var trackHeaders: some View {
-        VStack(spacing: 0) {
+    private var pinnedRuler: some View {
+        HStack(spacing: 0) {
             HStack {
                 Text("TRACKS")
                     .font(.caption2.weight(.semibold))
@@ -243,9 +264,36 @@ private struct TimelineEditor: View {
                 Text("M  S").font(.caption2.monospaced()).foregroundStyle(.tertiary)
             }
             .padding(.horizontal, 10)
-            .frame(height: rulerHeight)
-            .background(Color(nsColor: .controlBackgroundColor))
+            .frame(width: headerWidth, height: rulerHeight)
+            Divider()
+            GeometryReader { _ in
+                ZStack(alignment: .topLeading) {
+                    BeatRuler(lengthBeats: studio.project.lengthBeats, beatWidth: beatWidth, bpm: studio.project.bpm)
+                        .frame(width: timelineWidth, height: rulerHeight)
+                        .offset(x: -viewport.offset)
+                    Image(systemName: "triangle.fill")
+                        .font(.system(size: 8))
+                        .foregroundStyle(.red)
+                        .rotationEffect(.degrees(180))
+                        .offset(x: studio.audio.playheadBeat * beatWidth - viewport.offset - 3.3, y: rulerHeight - 7)
+                }
+                .allowsHitTesting(false)
+            }
+            .overlay {
+                Color.clear.contentShape(Rectangle())
+                    .gesture(DragGesture(minimumDistance: 0).onEnded {
+                        studio.seek(to: ($0.location.x + viewport.offset) / beatWidth)
+                    })
+            }
+            .clipped()
+            .disabled(studio.editingLocked)
+        }
+        .frame(height: rulerHeight)
+        .background(Color(nsColor: .controlBackgroundColor))
+    }
 
+    private var trackHeaders: some View {
+        VStack(spacing: 0) {
             ForEach(studio.project.tracks.indices, id: \.self) { index in
                 let track = studio.project.tracks[index]
                 HStack(spacing: 7) {
@@ -289,6 +337,7 @@ private struct TimelineEditor: View {
                         : Color(nsColor: .windowBackgroundColor)
                 )
                 .overlay(alignment: .bottom) { Divider() }
+                .id(track.id)
                 .onTapGesture { studio.selectTrack(track.id) }
                 .contextMenu {
                     Button("AI • Improvise from this track…") { studio.beginGeneration(trackID: track.id, useTrack: true) }
@@ -315,13 +364,9 @@ private struct TimelineEditor: View {
     }
 
     private var timeline: some View {
-        let width = max(900, (studio.project.lengthBeats + 16) * beatWidth)
+        let width = timelineWidth
         return ZStack(alignment: .topLeading) {
             VStack(spacing: 0) {
-                BeatRuler(lengthBeats: studio.project.lengthBeats, beatWidth: beatWidth, bpm: studio.project.bpm)
-                    .frame(width: width, height: rulerHeight)
-                    .contentShape(Rectangle())
-                    .gesture(DragGesture(minimumDistance: 0).onEnded { studio.seek(to: $0.location.x / beatWidth) })
                 ForEach(studio.project.tracks) { track in
                     VStack(spacing: 0) {
                     TimelineLane(
@@ -341,13 +386,7 @@ private struct TimelineEditor: View {
             Rectangle()
                 .fill(Color.red.opacity(0.9))
                 .frame(width: 1.5, height: studio.project.tracks.reduce(0) { $0 + studio.trackHeight($1.id) })
-                .offset(x: studio.audio.playheadBeat * beatWidth, y: rulerHeight)
-                .allowsHitTesting(false)
-            Image(systemName: "triangle.fill")
-                .font(.system(size: 8))
-                .foregroundStyle(.red)
-                .rotationEffect(.degrees(180))
-                .offset(x: studio.audio.playheadBeat * beatWidth - 3.3, y: rulerHeight - 7)
+                .offset(x: studio.audio.playheadBeat * beatWidth)
                 .allowsHitTesting(false)
         }
         .frame(width: width, alignment: .leading)
@@ -377,7 +416,7 @@ private struct BeatRuler: View {
                     .fill(beat.isMultiple(of: 4) ? Color.secondary.opacity(0.6) : Color.secondary.opacity(0.22))
                     .frame(width: 1, height: beat.isMultiple(of: 4) ? 12 : 6)
                     .offset(x: Double(beat) * beatWidth, y: 18)
-                if beat.isMultiple(of: 4) {
+                if beat.isMultiple(of: beatWidth < 14 ? 16 : beatWidth < 28 ? 8 : 4) {
                     Text("\(beat / 4 + 1) · \(Double(beat) * 60 / bpm, specifier: "%.1f")s")
                         .id("bar-\(beat / 4 + 1)")
                         .font(.caption2.monospacedDigit())

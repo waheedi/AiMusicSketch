@@ -40,6 +40,13 @@ struct AIMusicSketchpadApp: App {
                     .disabled(studio.editingLocked)
                 Button("Recording Controls") { studio.showRecordingPanel = true }
                     .keyboardShortcut("r", modifiers: [.command, .shift])
+                Button(studio.recording.isRecording ? "Stop & Save Take (R)" : "Record Track (R)", action: studio.toggleRecording)
+                    .disabled(!studio.canToggleRecording)
+                Divider()
+                Button("Zoom In") { studio.zoomTimeline(inward: true) }
+                    .keyboardShortcut("+", modifiers: .command)
+                Button("Zoom Out") { studio.zoomTimeline(inward: false) }
+                    .keyboardShortcut("-", modifiers: .command)
                 Divider()
                 Button(studio.audio.isPlaying ? "Stop" : "Play") { studio.togglePlayback() }
                     .keyboardShortcut(.space, modifiers: [])
