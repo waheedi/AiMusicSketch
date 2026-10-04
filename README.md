@@ -1,5 +1,7 @@
 # AI Music Sketchpad
 
+<img width="1465" height="932" alt="Screenshot 2026-10-04 at 09 52 36" src="https://github.com/user-attachments/assets/9bc451a6-af95-41b3-92d3-c7f64262bed8" />
+
 A native macOS multitrack sketchpad with local text-to-audio generation, microphone recording, and playable instruments. Requires macOS 15 or later; Apple Silicon is recommended for the audio model.
 
 ## Use
