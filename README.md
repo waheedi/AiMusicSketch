@@ -4,6 +4,12 @@
 
 A native macOS multitrack sketchpad with local text-to-audio generation, microphone recording, and playable instruments. Requires macOS 15 or later; Apple Silicon is recommended for the audio model.
 
+## Download
+
+Get the app from [GitHub Releases](https://github.com/waheedi/AiMusicSketch/releases/latest). Releases include a universal Apple Silicon/Intel macOS 15+ app, checksum, installation notes and optional AI setup scripts. Builds are currently ad-hoc signed, not Apple-notarized; see [installation and optional dependencies](docs/INSTALL.md).
+
+Maintainers: see [the release workflow and tagging guide](docs/RELEASING.md).
+
 ## Use
 
 - **Timeline / shortcuts (0.11.0):** the beat/time ruler stays pinned above the tracks when scrolling vertically and follows horizontal scrolling. Zoom with **⌘+ / ⌘−** (also **⌘=**), the magnifier buttons or the slider; zoom keeps the same left-edge beat unless playback-follow takes over. **R** starts recording on the selected track; press R again to stop and save. The red top Record button and the recording-panel button do the same thing. Use the piano icon or **⇧⌘R** to open input/instrument controls without recording. R is ignored in text fields, dialogs and sheets; it also works in hosted plug-in windows with Computer Keys enabled. There is no fixed track-count limit when adding, importing, generating or reopening projects; CPU and memory still limit practical project size.
