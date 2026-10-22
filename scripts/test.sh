@@ -11,6 +11,7 @@ swiftc -parse-as-library \
     Sources/AIMusicSketchpad/InstrumentAddOns.swift \
     Sources/AIMusicSketchpad/InstrumentAudioCapture.swift \
     Sources/AIMusicSketchpad/InstrumentControls.swift \
+    Sources/AIMusicSketchpad/SurgePatchBank.swift \
     Sources/AIMusicSketchpad/TimelineFollow.swift \
     Sources/AIMusicSketchpad/StudioShortcuts.swift \
     Sources/AIMusicSketchpad/Models.swift \
@@ -25,6 +26,7 @@ swiftc -parse-as-library \
     Sources/AIMusicSketchpad/AudioEngineController.swift \
     Sources/AIMusicSketchpad/AssetManager.swift \
     Sources/AIMusicSketchpad/ClipEditing.swift \
+    Sources/AIMusicSketchpad/ClipMerge.swift \
     Sources/AIMusicSketchpad/ClipNoteLayout.swift \
     Sources/AIMusicSketchpad/ClipNoteView.swift \
     Sources/AIMusicSketchpad/RecordingController.swift \
@@ -34,5 +36,7 @@ swiftc -parse-as-library \
     Sources/AIMusicSketchpad/StudioModel.swift \
     scripts/SmokeTest.swift \
     scripts/InstrumentTests.swift \
+    scripts/EditingFeatureTests.swift \
+    scripts/PlaybackPerformanceTests.swift \
     -o "$output"
 "$output" "$@"

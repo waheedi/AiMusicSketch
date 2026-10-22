@@ -27,9 +27,11 @@ struct AutomationLane: Codable, Hashable, Identifiable {
     var parameter: AutomationParameter
     var points: [AutomationPoint] = []
     var id: AutomationParameter { parameter }
-    func value(at seconds: Double) -> Double {
-        let sorted = points.filter { $0.seconds.isFinite && $0.value.isFinite && $0.seconds >= 0 }
-            .sorted { $0.seconds < $1.seconds }
+    var sortedPoints: [AutomationPoint] {
+        points.filter { $0.seconds.isFinite && $0.value.isFinite && $0.seconds >= 0 }.sorted { $0.seconds < $1.seconds }
+    }
+    func value(at seconds: Double, presorted: Bool = false) -> Double {
+        let sorted = presorted ? points : sortedPoints
         var previous = AutomationPoint(seconds: 0, value: 0)
         for point in sorted {
             if seconds < point.seconds {
@@ -44,10 +46,10 @@ struct AutomationLane: Codable, Hashable, Identifiable {
 }
 
 extension TrackModel {
-    func automated(at seconds: Double) -> TrackModel {
+    func automated(at seconds: Double, presorted: Bool = false) -> TrackModel {
         var result = self
         for lane in automation ?? [] {
-            let offset = lane.value(at: seconds) * lane.parameter.scale
+            let offset = lane.value(at: seconds, presorted: presorted) * lane.parameter.scale
             switch lane.parameter {
             case .volume: result.volume = max(0, min(1, volume + offset))
             case .pan: result.pan = max(-1, min(1, pan + offset))
@@ -63,6 +65,20 @@ extension TrackModel {
             case .filterResonance: result.effects.filterResonance = max(0, min(1, effects.filterResonance + offset))
             case .delayTime: result.effects.delayTime = max(0.01, min(2, effects.delayTime + offset))
             case .delayFeedback: result.effects.delayFeedback = max(0, min(0.85, effects.delayFeedback + offset))
+            }
+        }
+        return result
+    }
+}
+
+extension StudioProject {
+    // Prepare once per edit/start, never sort/allocate automation points on each transport tick.
+    func preparedForPlayback() -> StudioProject {
+        var result = self
+        for index in result.tracks.indices {
+            result.tracks[index].automation = tracks[index].automation?.compactMap { lane in
+                let points = lane.sortedPoints
+                return points.isEmpty ? nil : AutomationLane(parameter: lane.parameter, points: points)
             }
         }
         return result

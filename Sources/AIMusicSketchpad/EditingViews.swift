@@ -11,6 +11,13 @@ struct ClipContextMenu: View {
         }
         Button("Copy Clip") { studio.copyClip(clip.id) }
         Button("Duplicate After This Clip") { studio.duplicateClip(clip.id) }
+        if studio.selectedClipIDs.contains(clip.id),
+           let track = studio.project.tracks.first(where: { $0.id == trackID }),
+           track.clips.filter({ studio.selectedClipIDs.contains($0.id) }).count > 1 {
+            Button("Merge Selected Clips (Keep Notes When Compatible)") {
+                studio.mergeClips(on: trackID, selectedOnly: true)
+            }.disabled(studio.editingLocked)
+        }
         Button("AI • Improvise from this clip…") { studio.beginGeneration(trackID: trackID, clipID: clip.id, useTrack: true) }
         Divider()
         Button("Loop ×2") { studio.loopClip(clip.id, times: 2) }
@@ -31,8 +38,9 @@ struct ClipContextMenu: View {
             studio.splitSelectedClip()
         }
         Divider()
-        Button("Delete clip", role: .destructive) {
-            studio.selectClip(trackID: trackID, clipID: clip.id)
+        Button(studio.selectedClipIDs.contains(clip.id) && studio.selectedClipIDs.count > 1
+               ? "Delete \(studio.selectedClipIDs.count) Selected Clips" : "Delete Clip", role: .destructive) {
+            if !studio.selectedClipIDs.contains(clip.id) { studio.selectClip(trackID: trackID, clipID: clip.id) }
             studio.deleteSelectedClip()
         }
     }

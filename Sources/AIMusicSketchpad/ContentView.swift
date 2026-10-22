@@ -118,9 +118,7 @@ struct ContentView: View {
             .tint(studio.audio.isPlaying ? .red : .blue)
             .keyboardShortcut(.space, modifiers: [])
 
-            Text(beatLabel(studio.audio.playheadBeat))
-                .font(.system(.body, design: .monospaced).weight(.semibold))
-                .frame(width: 64)
+            TransportReadout(audio: studio.audio)
 
             compactButton("Export", systemImage: "square.and.arrow.up", action: studio.exportMix)
         }
@@ -160,10 +158,35 @@ struct ContentView: View {
         .help(title)
     }
 
-    private func beatLabel(_ beat: Double) -> String {
-        let bar = Int(beat / 4) + 1
-        let beatInBar = Int(beat.truncatingRemainder(dividingBy: 4)) + 1
-        return String(format: "%02d.%02d", bar, beatInBar)
+}
+
+private struct TransportReadout: View {
+    @ObservedObject var audio: AudioEngineController
+    var body: some View {
+        Text(String(format: "%02d.%02d", Int(audio.playheadBeat / 4) + 1,
+                    Int(audio.playheadBeat.truncatingRemainder(dividingBy: 4)) + 1))
+            .font(.system(.body, design: .monospaced).weight(.semibold))
+            .frame(width: 64)
+    }
+}
+
+private struct PlayheadOverlay: View {
+    @ObservedObject var audio: AudioEngineController
+    let beatWidth: Double
+    var scrollOffset = 0.0
+    var ruler = false
+    var body: some View {
+        Group {
+            if ruler {
+                Image(systemName: "triangle.fill")
+                    .font(.system(size: 8)).foregroundStyle(.red).rotationEffect(.degrees(180))
+                    .offset(x: audio.playheadBeat * beatWidth - scrollOffset - 3.3, y: 23)
+            } else {
+                Rectangle().fill(Color.red.opacity(0.9)).frame(width: 1.5)
+                    .offset(x: audio.playheadBeat * beatWidth)
+            }
+        }
+        .allowsHitTesting(false)
     }
 }
 
@@ -171,7 +194,10 @@ private struct TimelineEditor: View {
     @ObservedObject var studio: StudioModel
     private let headerWidth = 208.0
     private var beatWidth: Double { studio.timelineBeatWidth }
-    private var timelineWidth: Double { max(900, (studio.project.lengthBeats + 16) * beatWidth) }
+    private var visibleBeats: Double { max(studio.project.contentEndBeat, max(studio.project.lengthBeats, displayedEndBeat)) + 16 }
+    private var timelineWidth: Double { max(900, visibleBeats * beatWidth) }
+    @GestureState private var draggedEndBeat: Double?
+    private var displayedEndBeat: Double { draggedEndBeat ?? studio.project.lengthBeats }
     @AppStorage("timelineFollowPlayhead") private var followPlayhead = true
     @State private var scrollPosition = ScrollPosition(x: 0)
     @State private var viewport = TimelineViewport()
@@ -198,7 +224,7 @@ private struct TimelineEditor: View {
                             viewport = new
                             if old.width != new.width || old.contentWidth != new.contentWidth { followCursor() }
                         }
-                        .onChange(of: studio.audio.playheadBeat) { _, _ in followCursor() }
+                        .onReceive(studio.audio.$playheadBeat) { beat in followCursor(beat: beat) }
                         .onChange(of: studio.audio.isPlaying) { _, playing in
                             if playing { followCursor(force: true) }
                         }
@@ -223,7 +249,7 @@ private struct TimelineEditor: View {
                 }
                 .disabled(studio.editingLocked)
                 Button(role: .destructive) { studio.deleteSelectedTrack() } label: {
-                    Label("Remove", systemImage: "minus")
+                    Label(studio.selectedTrackIDs.count > 1 ? "Remove \(studio.selectedTrackIDs.count) Tracks" : "Remove Track", systemImage: "minus")
                 }
                 .disabled(studio.selectedTrackIndex == nil || studio.editingLocked)
                 Spacer()
@@ -238,7 +264,8 @@ private struct TimelineEditor: View {
                 Slider(value: $studio.timelineBeatWidth, in: 8...160).frame(width: 90)
                 Button { studio.zoomTimeline(inward: true) } label: { Image(systemName: "plus.magnifyingglass") }
                     .help("Zoom in (⌘+ or ⌘=)")
-                Text("Drag to move • edges resize")
+                Text(studio.selectedClipIDs.count > 1 ? "\(studio.selectedClipIDs.count) clips selected • Delete to remove"
+                     : "⌘/Shift-click selects • drag END to resize project")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }
@@ -247,8 +274,8 @@ private struct TimelineEditor: View {
         }
     }
 
-    private func followCursor(force: Bool = false) {
-        if let target = TimelineFollow.target(playheadX: studio.audio.playheadBeat * beatWidth,
+    private func followCursor(force: Bool = false, beat: Double? = nil) {
+        if let target = TimelineFollow.target(playheadX: (beat ?? studio.audio.playheadBeat) * beatWidth,
             viewport: viewport, enabled: followPlayhead, playing: studio.audio.isPlaying, force: force) {
             scrollPosition.scrollTo(x: target)
         }
@@ -268,28 +295,52 @@ private struct TimelineEditor: View {
             Divider()
             GeometryReader { _ in
                 ZStack(alignment: .topLeading) {
-                    BeatRuler(lengthBeats: studio.project.lengthBeats, beatWidth: beatWidth, bpm: studio.project.bpm)
+                    BeatRuler(lengthBeats: visibleBeats, beatWidth: beatWidth, bpm: studio.project.bpm)
                         .frame(width: timelineWidth, height: rulerHeight)
                         .offset(x: -viewport.offset)
-                    Image(systemName: "triangle.fill")
-                        .font(.system(size: 8))
-                        .foregroundStyle(.red)
-                        .rotationEffect(.degrees(180))
-                        .offset(x: studio.audio.playheadBeat * beatWidth - viewport.offset - 3.3, y: rulerHeight - 7)
+                        .allowsHitTesting(false)
+                    PlayheadOverlay(audio: studio.audio, beatWidth: beatWidth, scrollOffset: viewport.offset, ruler: true)
+                    Color.clear.contentShape(Rectangle())
+                        .gesture(DragGesture(minimumDistance: 0).onEnded {
+                            studio.seek(to: ($0.location.x + viewport.offset) / beatWidth)
+                        })
+                    projectEndHandle
                 }
-                .allowsHitTesting(false)
-            }
-            .overlay {
-                Color.clear.contentShape(Rectangle())
-                    .gesture(DragGesture(minimumDistance: 0).onEnded {
-                        studio.seek(to: ($0.location.x + viewport.offset) / beatWidth)
-                    })
+                .coordinateSpace(name: "projectRuler")
             }
             .clipped()
             .disabled(studio.editingLocked)
         }
         .frame(height: rulerHeight)
         .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    private var projectEndHandle: some View {
+        Label("END", systemImage: "arrow.left.and.right")
+            .font(.system(size: 10, weight: .bold)).foregroundStyle(.black)
+            .frame(width: 54, height: 24)
+            .background(.yellow, in: RoundedRectangle(cornerRadius: 4))
+            .contentShape(Rectangle())
+            .offset(x: displayedEndBeat * beatWidth - viewport.offset - 27, y: 3)
+            .gesture(DragGesture(minimumDistance: 2, coordinateSpace: .named("projectRuler"))
+                .updating($draggedEndBeat) { value, state, _ in
+                    let delta = value.translation.width / beatWidth
+                    state = studio.projectEndBeat(for: studio.project.lengthBeats + delta)
+                }
+                .onEnded { value in
+                    studio.setProjectEnd(to: studio.project.lengthBeats + value.translation.width / beatWidth)
+                })
+            .contextMenu {
+                Button("Fit End to Clips") {
+                    studio.setProjectEnd(to: max(4, ceil(studio.project.contentEndBeat / 4) * 4))
+                }
+            }
+            .help(String(format: "Project end: %.1f s. Drag to shorten/extend playback and export. Clips are not deleted.", displayedEndBeat * 60 / studio.project.bpm))
+            .accessibilityLabel("Project end")
+            .accessibilityValue("\(displayedEndBeat) beats")
+            .accessibilityAdjustableAction { direction in
+                studio.setProjectEnd(to: studio.project.lengthBeats + (direction == .increment ? 4 : -4))
+            }
     }
 
     private var trackHeaders: some View {
@@ -332,14 +383,32 @@ private struct TimelineEditor: View {
                 .frame(height: studio.trackHeight(track.id))
                 .contentShape(Rectangle())
                 .background(
-                    studio.selectedTrackID == track.id
-                        ? Color.accentColor.opacity(0.12)
+                    studio.selectedTrackIDs.contains(track.id)
+                        ? Color.accentColor.opacity(0.22)
                         : Color(nsColor: .windowBackgroundColor)
                 )
                 .overlay(alignment: .bottom) { Divider() }
                 .id(track.id)
-                .onTapGesture { studio.selectTrack(track.id) }
+                .onTapGesture {
+                    studio.selectTrack(track.id, additive: NSEvent.modifierFlags.contains(.command),
+                                       range: NSEvent.modifierFlags.contains(.shift))
+                }
+                .help("Shift-click selects a track range; ⌘-click toggles tracks. Delete removes selected tracks.")
+                .draggable("track:\(track.id.uuidString)")
+                .dropDestination(for: String.self) { items, _ in
+                    guard let item = items.first, item.hasPrefix("track:"),
+                          let id = UUID(uuidString: String(item.dropFirst(6))) else { return false }
+                    return studio.moveTrack(id, to: track.id)
+                }
                 .contextMenu {
+                    Button("Duplicate Track") { studio.duplicateTrack(track.id) }
+                    Button("Merge Clips (Keep Notes When Compatible)") { studio.mergeClips(on: track.id) }
+                        .disabled(track.clips.count < 2 || studio.editingLocked)
+                    Button(studio.selectedTrackIDs.contains(track.id) && studio.selectedTrackIDs.count > 1
+                           ? "Delete \(studio.selectedTrackIDs.count) Selected Tracks" : "Delete Track", role: .destructive) {
+                        if !studio.selectedTrackIDs.contains(track.id) { studio.selectTrack(track.id) }
+                        studio.deleteSelectedTrack()
+                    }.disabled(studio.editingLocked)
                     Button("AI • Improvise from this track…") { studio.beginGeneration(trackID: track.id, useTrack: true) }
                         .disabled(track.clips.isEmpty)
                     Button("Paste clip at playhead") { studio.selectTrack(track.id); studio.pasteClip() }
@@ -383,11 +452,14 @@ private struct TimelineEditor: View {
                     .zIndex(track.clips.contains { $0.id == studio.draggingClipID } ? 10 : 0)
                 }
             }
-            Rectangle()
-                .fill(Color.red.opacity(0.9))
-                .frame(width: 1.5, height: studio.project.tracks.reduce(0) { $0 + studio.trackHeight($1.id) })
-                .offset(x: studio.audio.playheadBeat * beatWidth)
+            Rectangle().fill(Color.black.opacity(0.2))
+                .frame(width: max(0, width - displayedEndBeat * beatWidth))
+                .offset(x: displayedEndBeat * beatWidth)
                 .allowsHitTesting(false)
+            Rectangle().fill(Color.yellow.opacity(0.8)).frame(width: 1)
+                .offset(x: displayedEndBeat * beatWidth).allowsHitTesting(false)
+            PlayheadOverlay(audio: studio.audio, beatWidth: beatWidth)
+                .frame(height: studio.project.tracks.reduce(0) { $0 + studio.trackHeight($1.id) })
         }
         .frame(width: width, alignment: .leading)
         .coordinateSpace(name: "timeline")
@@ -409,22 +481,20 @@ private struct BeatRuler: View {
     let bpm: Double
 
     var body: some View {
-        ZStack(alignment: .topLeading) {
-            Color(nsColor: .controlBackgroundColor)
-            ForEach(0...Int(ceil(lengthBeats)), id: \.self) { beat in
-                Rectangle()
-                    .fill(beat.isMultiple(of: 4) ? Color.secondary.opacity(0.6) : Color.secondary.opacity(0.22))
-                    .frame(width: 1, height: beat.isMultiple(of: 4) ? 12 : 6)
-                    .offset(x: Double(beat) * beatWidth, y: 18)
+        Canvas { context, _ in
+            for beat in 0...Int(ceil(lengthBeats)) {
+                context.fill(Path(CGRect(x: Double(beat) * beatWidth, y: 18, width: 1,
+                                         height: beat.isMultiple(of: 4) ? 12 : 6)),
+                             with: .color(.secondary.opacity(beat.isMultiple(of: 4) ? 0.6 : 0.22)))
                 if beat.isMultiple(of: beatWidth < 14 ? 16 : beatWidth < 28 ? 8 : 4) {
-                    Text("\(beat / 4 + 1) · \(Double(beat) * 60 / bpm, specifier: "%.1f")s")
-                        .id("bar-\(beat / 4 + 1)")
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                        .offset(x: Double(beat) * beatWidth + 4, y: 3)
+                    context.draw(Text("\(beat / 4 + 1) · \(Double(beat) * 60 / bpm, specifier: "%.1f")s")
+                        .font(.caption2.monospacedDigit()).foregroundColor(.secondary),
+                                 at: CGPoint(x: Double(beat) * beatWidth + 4, y: 3), anchor: .topLeading)
                 }
             }
         }
+        .background(Color(nsColor: .controlBackgroundColor))
+        .accessibilityLabel("Timeline ruler, bars and seconds")
     }
 }
 
@@ -434,16 +504,24 @@ private struct TimelineLane: View {
     let beatWidth: Double
     let rowHeight: Double
     let width: Double
+    @GestureState private var selectionRange: ClosedRange<Double>?
 
     var body: some View {
         ZStack(alignment: .leading) {
-            BeatGrid(lengthBeats: studio.project.lengthBeats, beatWidth: beatWidth)
+            BeatGrid(lengthBeats: width / beatWidth, beatWidth: beatWidth)
                 .contentShape(Rectangle())
+                .onTapGesture { studio.selectClips(trackID: track.id, ids: []) }
                 .gesture(
-                    DragGesture(minimumDistance: 0)
+                    DragGesture(minimumDistance: 4)
+                        .updating($selectionRange) { value, state, _ in
+                            state = min(value.startLocation.x, value.location.x)...max(value.startLocation.x, value.location.x)
+                        }
                         .onEnded { value in
-                            studio.seek(to: value.location.x / beatWidth)
-                            studio.selectTrack(track.id)
+                            let lower = min(value.startLocation.x, value.location.x) / beatWidth
+                            let upper = max(value.startLocation.x, value.location.x) / beatWidth
+                            let ids = Set(track.clips.filter { $0.startBeat < upper && $0.endBeat > lower }.map(\.id))
+                            studio.selectClips(trackID: track.id, ids: ids,
+                                               additive: NSEvent.modifierFlags.intersection([.command, .shift]).isEmpty == false)
                         }
                 )
             ForEach(track.clips) { clip in
@@ -455,6 +533,12 @@ private struct TimelineLane: View {
                     beatWidth: beatWidth,
                     height: rowHeight - 14
                 )
+            }
+            if let range = selectionRange {
+                Rectangle().fill(Color.accentColor.opacity(0.18))
+                    .overlay(Rectangle().stroke(Color.accentColor, lineWidth: 1))
+                    .frame(width: range.upperBound - range.lowerBound, height: rowHeight)
+                    .offset(x: range.lowerBound).allowsHitTesting(false)
             }
         }
         .frame(width: width, height: rowHeight)
@@ -513,8 +597,8 @@ private struct TimelineClip: View {
                 )
             RoundedRectangle(cornerRadius: 7)
                 .stroke(
-                    studio.selectedClipID == clip.id ? Color.white : color.opacity(0.8),
-                    lineWidth: studio.selectedClipID == clip.id ? 2 : 1
+                    studio.selectedClipIDs.contains(clip.id) ? Color.white : color.opacity(0.8),
+                    lineWidth: studio.selectedClipIDs.contains(clip.id) ? 2 : 1
                 )
             Group {
                 if preview.midiNotes != nil {
@@ -563,7 +647,12 @@ private struct TimelineClip: View {
             studio.selectClip(trackID: trackID, clipID: clip.id)
             studio.editNotes(clip.id)
         }
-        .onTapGesture { studio.selectClip(trackID: trackID, clipID: clip.id) }
+        .onTapGesture {
+            studio.selectClip(trackID: trackID, clipID: clip.id,
+                              additive: NSEvent.modifierFlags.contains(.command),
+                              range: NSEvent.modifierFlags.contains(.shift))
+        }
+        .help("⌘-click to toggle selection; Shift-click to select a range. Delete removes selected clips. Seek using the ruler above.")
         .contextMenu { ClipContextMenu(studio: studio, trackID: trackID, clip: clip) }
         .overlay(alignment: .leading) { trimHandle(left: true) }
         .overlay(alignment: .trailing) { trimHandle(left: false) }
@@ -577,7 +666,7 @@ private struct TimelineClip: View {
 
     private func trimHandle(left: Bool) -> some View {
         RoundedRectangle(cornerRadius: 2)
-            .fill(Color.white.opacity(studio.selectedClipID == clip.id ? 0.9 : 0.45))
+            .fill(Color.white.opacity(studio.selectedClipIDs.contains(clip.id) ? 0.9 : 0.45))
             .frame(width: 4, height: 30)
             .frame(width: min(16, max(18, preview.durationBeats * beatWidth) / 3), height: height)
             .contentShape(Rectangle())
@@ -591,7 +680,7 @@ private struct TimelineClip: View {
                     studio.resizeClip(clip.id, leftEdge: left,
                                       to: (left ? clip.startBeat : clip.endBeat) + value.translation.width / beatWidth)
                 })
-            .help(clip.loopEnabled ? "Drag to shorten or extend repetitions" : "Drag to trim or reveal source audio. Enable looping to repeat beyond the source.")
+            .help("Drag outward to add empty space; inward to trim. Loop ×2/×4 repeats the whole block, including its empty space.")
     }
 }
 

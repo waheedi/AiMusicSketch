@@ -25,6 +25,7 @@ fi
 cp "$project_dir/Info.plist" "$app_dir/Contents/Info.plist"
 cp "$project_dir/scripts/audio_worker.py" "$app_dir/Contents/Resources/audio_worker.py"
 cp "$project_dir/LICENSE" "$app_dir/Contents/Resources/LICENSE"
+ditto "$project_dir/Resources/SketchpadPulse" "$app_dir/Contents/Resources/SketchpadPulse"
 
 codesign --force --sign - \
     --identifier local.bargo.AIMusicSketchpad \

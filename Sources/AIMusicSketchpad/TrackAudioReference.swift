@@ -25,9 +25,8 @@ struct TrackAudioReference {
         let cropped = original.clips.compactMap { clip -> ClipModel? in
             let lower = max(start, clip.startBeat), upper = min(end, clip.endBeat)
             guard upper > lower else { return nil }
-            var result = clip
-            let skip = (clip.playbackOffsetSeconds ?? 0) + (lower - clip.startBeat) * 60 / project.bpm
-            result.playbackOffsetSeconds = clip.loopEnabled ? skip.truncatingRemainder(dividingBy: clip.sourceRegionSeconds) : skip
+            var result = ClipEditing.resize(ClipEditing.resize(clip, leftEdge: true, to: lower, bpm: project.bpm, minimumBeats: 0),
+                                            leftEdge: false, to: upper, bpm: project.bpm, minimumBeats: 0)
             result.startBeat = lower - start
             result.durationBeats = upper - lower
             return result

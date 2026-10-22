@@ -54,6 +54,22 @@ struct InstrumentControls: View {
             case .violin, .shaker: creatorControls
             case .audioUnit: pluginControls
             }
+            HStack {
+                Menu("Sketchpad Pulse · New Sounds") {
+                    ForEach(SurgePatchBank.presets) { preset in
+                        Button(preset.name) { studio.loadSurgePreset(preset) }
+                    }
+                    Divider()
+                    Button("Install Bank in Surge's Browser") {
+                        do {
+                            _ = try SurgePatchBank.installInSurge()
+                            studio.status = "Installed Sketchpad Pulse • Surge Menu → Data Folders → Rescan all data folders"
+                        } catch { studio.alertMessage = error.localizedDescription }
+                    }
+                }.disabled(studio.editingLocked)
+                Text("6 reference-inspired synth sounds • 1–6 changes octave • editable in Surge XT")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
     }
     private var creatorControls: some View {

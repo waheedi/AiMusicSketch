@@ -22,12 +22,22 @@ final class StudioModel: ObservableObject {
     private var editTitle = "Edit"
     @Published var selectedTrackID: UUID? {
         didSet {
+            selectedTrackIDs = selectedTrackID.map { [$0] } ?? []
             guard oldValue != selectedTrackID else { return }
             if !suppressInstrumentStore { storeInstrument(on: oldValue) }
             restoreTrackInstrument()
         }
     }
-    @Published var selectedClipID: UUID?
+    @Published private(set) var selectedTrackIDs = Set<UUID>()
+    @Published private(set) var selectingTracks = true
+    private var trackSelectionAnchor: UUID?
+    @Published var selectedClipID: UUID? {
+        didSet {
+            selectedClipIDs = selectedClipID.map { [$0] } ?? []
+            if selectedClipID != nil { selectingTracks = false }
+        }
+    }
+    @Published private(set) var selectedClipIDs = Set<UUID>()
     @Published var status = "Ready"
     @Published var alertMessage: String?
     @Published var isBusy = false
@@ -59,6 +69,23 @@ final class StudioModel: ObservableObject {
         timelineBeatWidth = min(160, max(8, timelineBeatWidth * (inward ? 1.25 : 0.8)))
     }
 
+    func projectEndBeat(for beat: Double) -> Double {
+        guard beat.isFinite else { return project.lengthBeats }
+        return min(99_996, max(0.25, snappedBeat(beat)))
+    }
+
+    func setProjectEnd(to beat: Double) {
+        guard !editingLocked, beat.isFinite else { return }
+        let end = projectEndBeat(for: beat)
+        guard end != project.lengthBeats || project.hasManualEnd != true else { return }
+        beginEdit("Resize Project"); defer { endEdit() }
+        audio.stop()
+        project.hasManualEnd = true
+        project.lengthBeats = end
+        audio.playheadBeat = min(audio.playheadBeat, end)
+        status = String(format: "Project end: %.2f beats · %.1f s • clips preserved", end, end * 60 / project.bpm)
+    }
+
     func toggleRecording() {
         guard canToggleRecording else { return }
         if recording.isRecording { stop() }
@@ -67,9 +94,20 @@ final class StudioModel: ObservableObject {
 
     init() {
         selectedTrackID = project.tracks.first?.id
-        // Forward nested observable objects so transport and recording updates redraw the UI.
-        audio.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }.store(in: &subscriptions)
-        recording.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }.store(in: &subscriptions)
+        selectedTrackIDs = Set(project.tracks.prefix(1).map(\.id))
+        // Only transport state invalidates the studio. Cursor views observe audio directly.
+        audio.$isPlaying.removeDuplicates().sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &subscriptions)
+        // Meter ticks and note-on/off events belong to the small meter/keyboard views.
+        Publishers.MergeMany([
+            recording.$source.map { _ in () }.eraseToAnyPublisher(),
+            recording.$configuration.map { _ in () }.eraseToAnyPublisher(),
+            recording.$isLoadingInstrument.map { _ in () }.eraseToAnyPublisher(),
+            recording.$installedAudioUnits.map { _ in () }.eraseToAnyPublisher(),
+            recording.$instrumentMessage.map { _ in () }.eraseToAnyPublisher(),
+            recording.$octave.map { _ in () }.eraseToAnyPublisher(),
+            recording.$isRecording.map { _ in () }.eraseToAnyPublisher(),
+            recording.$midiStatus.map { _ in () }.eraseToAnyPublisher()
+        ]).sink { [weak self] in self?.objectWillChange.send() }.store(in: &subscriptions)
         audio.$playheadBeat.sink { [weak self] beat in
             guard let self, self.recording.isRecording, beat + 4 > self.project.lengthBeats else { return }
             self.suppressHistory = true
@@ -80,6 +118,7 @@ final class StudioModel: ObservableObject {
             self?.stop()
             self?.alertMessage = message
         }
+        audio.onFailure = { [weak self] message in self?.alertMessage = message }
     }
 
     var selectedTrackIndex: Int? { project.tracks.firstIndex { $0.id == selectedTrackID } }
@@ -115,6 +154,7 @@ final class StudioModel: ObservableObject {
         project = restored
         suppressHistory = false
         if selectedTrackIndex == nil { selectedTrackID = project.tracks.first?.id }
+        selectedTrackIDs.formIntersection(project.tracks.map(\.id))
         restoreTrackInstrument()
         if location(selectedClipID) == nil { selectedClipID = nil }
         audio.playheadBeat = min(audio.playheadBeat, project.lengthBeats)
@@ -210,6 +250,8 @@ final class StudioModel: ObservableObject {
         selectedTrackID = project.tracks.first?.id
         selectedClipID = nil
         status = "New project"
+        selectingTracks = true
+        trackSelectionAnchor = nil
     }
 
     func addTrack() {
@@ -219,31 +261,158 @@ final class StudioModel: ObservableObject {
         project.tracks.append(track)
         selectedTrackID = track.id
         selectedClipID = nil
+        selectingTracks = true
+    }
+
+    func moveTrack(_ id: UUID, to target: UUID) -> Bool {
+        guard !editingLocked, id != target,
+              let from = project.tracks.firstIndex(where: { $0.id == id }),
+              let to = project.tracks.firstIndex(where: { $0.id == target }) else { return false }
+        beginEdit("Move Track"); defer { endEdit() }
+        var tracks = project.tracks
+        let moved = tracks.remove(at: from)
+        tracks.insert(moved, at: to)
+        project.tracks = tracks
+        return true
+    }
+
+    func duplicateTrack(_ id: UUID) {
+        guard !editingLocked, let index = project.tracks.firstIndex(where: { $0.id == id }) else { return }
+        beginEdit("Duplicate Track"); defer { endEdit() }
+        audio.stop()
+        if selectedTrackID == id { storeInstrument(on: id) }
+        var copy = project.tracks[index]
+        copy.id = UUID(); copy.name += " copy"
+        copy.clips = copy.clips.map { var clip = $0; clip.id = UUID(); return clip }
+        project.tracks.insert(copy, at: index + 1)
+        selectedTrackID = copy.id
+        selectedClipID = nil
+        selectingTracks = true
+    }
+
+    func mergeClips(on id: UUID, selectedOnly: Bool = false) {
+        guard !editingLocked, let original = project.tracks.first(where: { $0.id == id }) else { return }
+        let clips = original.clips.filter { !selectedOnly || selectedClipIDs.contains($0.id) }
+        guard clips.count > 1,
+              let start = clips.map(\.startBeat).min(), let end = clips.map(\.endBeat).max(),
+              start.isFinite, end.isFinite, end > start else { return }
+        audio.stop()
+        var dry = TrackModel.new(index: 0)
+        dry.volume = 1
+        dry.clips = clips.map { var clip = $0; clip.startBeat -= start; return clip }
+        var render = project
+        render.tracks = [dry]; render.lengthBeats = end - start
+        let snapshot = render
+        let url = AssetManager.shared.newAssetURL(prefix: "Merged-track")
+        isBusy = true; status = "Merging clips…"
+        Task {
+            defer { isBusy = false }
+            do {
+                try await Task.detached(priority: .userInitiated) {
+                    try OfflineMixRenderer.render(project: snapshot, to: url)
+                }.value
+                guard let index = project.tracks.firstIndex(where: { $0.id == id }) else { return }
+                var merged = ClipModel(name: "\(original.name) merged", assetPath: url.path, startBeat: start,
+                    durationBeats: end - start, sourceDurationSeconds: (end - start) * 60 / snapshot.bpm)
+                if let configuration = ClipMerge.editableConfiguration(for: clips) {
+                    merged.midiNotes = ClipMerge.notes(for: clips, startingAt: start, bpm: snapshot.bpm)
+                    merged.midiSourceBPM = snapshot.bpm
+                    merged.instrument = configuration.builtIn
+                    merged.instrumentAddOn = configuration
+                    merged.notesEditable = true
+                }
+                beginEdit("Merge Clips"); defer { endEdit() }
+                let mergedIDs = Set(clips.map(\.id))
+                project.tracks[index].clips.removeAll { mergedIDs.contains($0.id) }
+                project.tracks[index].clips.append(merged)
+                selectedTrackID = id; selectedClipID = merged.id
+                status = "Merged \(clips.count) clips • \(merged.notesEditable == true ? "notes remain editable" : "audio bounce (mixed instruments or audio)") • Undo restores originals"
+            } catch {
+                try? FileManager.default.removeItem(at: url)
+                present(error)
+            }
+        }
     }
 
     func deleteSelectedTrack() {
-        guard !editingLocked, let index = selectedTrackIndex else { return }
-        beginEdit("Delete Track"); defer { endEdit() }
+        guard !editingLocked, !selectedTrackIDs.isEmpty else { return }
+        let index = selectedTrackIndex ?? 0
+        beginEdit("Delete Tracks"); defer { endEdit() }
         audio.stop()
-        project.tracks.remove(at: index)
+        recording.panic()
+        project.tracks.removeAll { selectedTrackIDs.contains($0.id) }
         if project.tracks.isEmpty { project.tracks.append(.new(index: 0)) }
         selectedTrackID = project.tracks[min(index, project.tracks.count - 1)].id
         selectedClipID = nil
+        selectingTracks = true
+        trackSelectionAnchor = selectedTrackID
         project.refreshLength()
     }
 
-    func selectTrack(_ id: UUID) {
-        guard !recording.isRecording, let track = project.tracks.first(where: { $0.id == id }) else { return }
-        selectedTrackID = id
+    func selectTrack(_ id: UUID, additive: Bool = false, range: Bool = false) {
+        guard !recording.isRecording, project.tracks.contains(where: { $0.id == id }) else { return }
+        let ordered = project.tracks.map(\.id)
+        var ids: Set<UUID> = [id]
+        if range, let anchor = (trackSelectionAnchor ?? selectedTrackID).flatMap({ ordered.firstIndex(of: $0) }),
+           let end = ordered.firstIndex(of: id) {
+            ids = Set(ordered[min(anchor, end)...max(anchor, end)])
+            if additive { ids.formUnion(selectedTrackIDs) }
+        } else if additive {
+            ids = selectedTrackIDs
+            if !ids.insert(id).inserted { ids.remove(id) }
+        }
+        selectedTrackID = ids.contains(id) ? id : ordered.first { ids.contains($0) }
+        selectedTrackIDs = ids
+        if !range { trackSelectionAnchor = selectedTrackID }
+        selectedClipID = nil
+        selectingTracks = true
         NSApp?.keyWindow?.makeFirstResponder(nil)
-        if !track.clips.contains(where: { $0.id == selectedClipID }) { selectedClipID = nil }
     }
 
-    func selectClip(trackID: UUID, clipID: UUID) {
+    func deleteSelection() {
+        if selectingTracks { deleteSelectedTrack() } else { deleteSelectedClip() }
+    }
+
+    func selectAll() {
+        if selectingTracks && !recording.isRecording {
+            selectedTrackID = selectedTrackID ?? project.tracks.first?.id
+            selectedTrackIDs = Set(project.tracks.map(\.id))
+        }
+        else { selectAllClips() }
+    }
+
+    func selectClip(trackID: UUID, clipID: UUID, additive: Bool = false, range: Bool = false) {
         guard !recording.isRecording else { return }
+        var ids: Set<UUID> = [clipID]
+        if range, let track = project.tracks.first(where: { $0.id == trackID }) {
+            let ordered = track.clips.sorted { $0.startBeat < $1.startBeat }.map(\.id)
+            if let anchor = selectedClipID.flatMap({ ordered.firstIndex(of: $0) }),
+               let end = ordered.firstIndex(of: clipID) {
+                ids = selectedClipIDs.union(ordered[min(anchor, end)...max(anchor, end)])
+            }
+        } else if additive {
+            ids = selectedClipIDs
+            if !ids.insert(clipID).inserted { ids.remove(clipID) }
+        }
         selectedTrackID = trackID
-        selectedClipID = clipID
+        selectedClipID = ids.contains(clipID) ? clipID : ids.first
+        selectedClipIDs = ids
         NSApp?.keyWindow?.makeFirstResponder(nil)
+    }
+
+    func selectClips(trackID: UUID, ids: Set<UUID>, additive: Bool = false) {
+        guard !recording.isRecording else { return }
+        let selection = additive ? selectedClipIDs.union(ids) : ids
+        selectedTrackID = trackID
+        selectedClipID = project.tracks.flatMap(\.clips).first { selection.contains($0.id) }?.id
+        selectedClipIDs = selection
+        selectingTracks = false
+        NSApp?.keyWindow?.makeFirstResponder(nil)
+    }
+
+    func selectAllClips() {
+        guard let index = selectedTrackIndex else { return }
+        selectClips(trackID: project.tracks[index].id, ids: Set(project.tracks[index].clips.map(\.id)))
     }
 
     func importAudio() {
@@ -278,6 +447,7 @@ final class StudioModel: ObservableObject {
                     let clip = ClipModel(name: entry.0, assetPath: entry.1.url.path, startBeat: start,
                         durationBeats: entry.1.duration * project.bpm / 60, sourceDurationSeconds: entry.1.duration)
                     project.tracks[index].clips.append(clip)
+                    project.refreshLength(extendingTo: clip.endBeat)
                     selectedTrackID = project.tracks[index].id
                     selectedClipID = clip.id
                 }
@@ -297,7 +467,7 @@ final class StudioModel: ObservableObject {
         project.tracks[destination].clips.append(moved)
         selectedTrackID = trackID
         selectedClipID = id
-        project.refreshLength()
+        project.refreshLength(extendingTo: moved.endBeat)
     }
 
     func trackHeight(_ id: UUID) -> Double { visibleAutomation[id] == nil ? 76 : 176 }
@@ -310,7 +480,7 @@ final class StudioModel: ObservableObject {
         beginEdit("Resize Clip"); defer { endEdit() }
         audio.stop()
         project.tracks[p.track].clips[p.clip] = resized
-        project.refreshLength()
+        project.refreshLength(extendingTo: resized.endBeat)
         status = resized.loopEnabled ? "Loop resized" : "Clip resized • source audio preserved"
     }
 
@@ -333,7 +503,7 @@ final class StudioModel: ObservableObject {
     func copyClip(_ id: UUID) {
         guard let clip = clip(id) else { return }
         copiedClip = clip
-        status = "Copied \(clip.name) • click a track/time, then paste"
+        status = "Copied \(clip.name) • select a track and ruler time, then paste"
     }
     func pasteClip() {
         guard !editingLocked, let clip = copiedClip, let track = selectedTrackIndex else { return }
@@ -355,7 +525,7 @@ final class StudioModel: ObservableObject {
         project.tracks[track].clips.append(copy)
         selectedTrackID = project.tracks[track].id
         selectedClipID = copy.id
-        project.refreshLength()
+        project.refreshLength(extendingTo: copy.endBeat)
         status = "Pasted clip • source audio preserved"
     }
     func copyCommand() {
@@ -425,8 +595,10 @@ final class StudioModel: ObservableObject {
                     rendered.playbackOffsetSeconds = 0
                     rendered.loopLengthSeconds = nil
                     rendered.loopEnabled = false
+                    rendered.leadingSilenceSeconds = nil
+                    rendered.trailingSilenceSeconds = nil
                     project.tracks[destination.track].clips[destination.clip] = ClipEditing.loop(rendered, times: times, bpm: snapshot.bpm)
-                    project.refreshLength()
+                    project.refreshLength(extendingTo: project.tracks[destination.track].clips[destination.clip].endBeat)
                     status = "Trimmed region looped ×\(times)"
                 } catch { present(error) }
             }
@@ -434,7 +606,7 @@ final class StudioModel: ObservableObject {
         }
         beginEdit("Loop Clip"); defer { endEdit() }
         project.tracks[p.track].clips[p.clip] = ClipEditing.loop(project.tracks[p.track].clips[p.clip], times: times, bpm: project.bpm)
-        project.refreshLength()
+        project.refreshLength(extendingTo: project.tracks[p.track].clips[p.clip].endBeat)
         status = "Loop length extended ×\(times)"
     }
 
@@ -444,7 +616,8 @@ final class StudioModel: ObservableObject {
         audio.stop()
         var clip = project.tracks[p.track].clips[p.clip]
         clip.loopEnabled = false
-        clip.durationBeats = min(clip.durationBeats, max(0.01, clip.sourceRegionSeconds - (clip.playbackOffsetSeconds ?? 0)) * project.bpm / 60)
+        let padding = (clip.leadingSilenceSeconds ?? 0) + (clip.trailingSilenceSeconds ?? 0)
+        clip.durationBeats = min(clip.durationBeats, (padding + max(0.01, clip.sourceRegionSeconds - (clip.playbackOffsetSeconds ?? 0))) * project.bpm / 60)
         project.tracks[p.track].clips[p.clip] = clip
         project.refreshLength()
     }
@@ -475,10 +648,12 @@ final class StudioModel: ObservableObject {
     }
 
     func deleteSelectedClip() {
-        guard !editingLocked, let p = selectedClipLocation else { return }
-        beginEdit("Delete Clip"); defer { endEdit() }
+        guard !editingLocked, !selectedClipIDs.isEmpty else { return }
+        beginEdit("Delete Clips"); defer { endEdit() }
         audio.stop()
-        project.tracks[p.track].clips.remove(at: p.clip)
+        var tracks = project.tracks
+        for index in tracks.indices { tracks[index].clips.removeAll { selectedClipIDs.contains($0.id) } }
+        project.tracks = tracks
         selectedClipID = nil
         project.refreshLength()
     }
@@ -561,7 +736,7 @@ final class StudioModel: ObservableObject {
                     project.tracks[index].clips.append(clip)
                     selectedTrackID = target
                     selectedClipID = clip.id
-                    project.refreshLength()
+                    project.refreshLength(extendingTo: clip.endBeat)
                     status = "Take saved to \(project.tracks[index].name)"
                 } catch { present(error) }
             }
@@ -582,12 +757,13 @@ final class StudioModel: ObservableObject {
         noteEditClipID = id
     }
 
-    func applyNotes(_ notes: [MIDINote], to id: UUID) async throws {
+    func applyNotes(_ notes: [MIDINote], to id: UUID, durationBeats: Double? = nil) async throws {
         guard !editingLocked, let original = clip(id), original.notesEditable == true else { return }
         let configuration = original.instrumentAddOn ?? InstrumentConfiguration(builtIn: original.instrument ?? .piano)
         let bpm = original.midiSourceBPM ?? project.bpm
-        let beats = original.sourceDurationSeconds * bpm / 60
-        guard notes.allSatisfy({ (0..<128).contains($0.pitch) && $0.startBeat.isFinite && $0.startBeat >= 0
+        let beats = max(original.sourceDurationSeconds * bpm / 60, durationBeats ?? 0)
+        guard beats.isFinite, beats * 60 / bpm < 3_600,
+            notes.allSatisfy({ (0..<128).contains($0.pitch) && $0.startBeat.isFinite && $0.startBeat >= 0
             && $0.startBeat < beats && $0.durationBeats.isFinite && $0.durationBeats > 0
             && $0.velocity.isFinite && $0.velocity > 0 && $0.velocity <= 1 }) else {
             throw MessageError("A note has invalid pitch, timing or velocity.")
@@ -597,7 +773,7 @@ final class StudioModel: ObservableObject {
         defer { isBusy = false }
         do {
             let url = AssetManager.shared.newAssetURL(prefix: "Edited-notes")
-            _ = try await Task.detached(priority: .userInitiated) {
+            let duration = try await Task.detached(priority: .userInitiated) {
                 try MIDIRenderer.render(notes: notes, configuration: configuration, bpm: bpm,
                     durationBeats: beats, sampleRate: rate, to: url, allowEmpty: true)
             }.value
@@ -607,7 +783,14 @@ final class StudioModel: ObservableObject {
             updated.assetPath = url.path
             updated.midiNotes = notes.sorted { $0.startBeat < $1.startBeat }
             updated.midiSourceBPM = bpm
+            let growth = max(0, duration - original.sourceDurationSeconds)
+            updated.sourceDurationSeconds = duration
+            if growth > 0.000001 {
+                updated.durationBeats += growth * project.bpm / 60
+                if let length = updated.loopLengthSeconds { updated.loopLengthSeconds = length + growth }
+            }
             project.tracks[p.track].clips[p.clip] = updated
+            project.refreshLength(extendingTo: growth > 0 ? updated.endBeat : nil)
             status = "Notes updated • Undo restores the previous take"
         } catch {
             status = "Notes unchanged"
@@ -628,6 +811,19 @@ final class StudioModel: ObservableObject {
     func instrumentChanged(reload: Bool = true) {
         if let index = selectedTrackIndex { project.tracks[index].instrumentConfiguration = recording.configuration }
         if reload { prepareKeyboard() } else { recording.applySynthSettings() }
+    }
+    func loadSurgePreset(_ preset: SurgePatchBank.Preset) {
+        guard !editingLocked, selectedTrackIndex != nil else { return }
+        do {
+            let configuration = try SurgePatchBank.configuration(for: preset)
+            recording.panic()
+            recording.configuration = configuration
+            recording.source = .keyboard
+            recording.octave = preset.octave
+            showRecordingPanel = true
+            instrumentChanged()
+            status = "Sketchpad Pulse • \(preset.name) • play keys or MIDI; 1–6 changes octave"
+        } catch { present(error) }
     }
     private func restoreTrackInstrument() {
         recording.panic()
@@ -665,6 +861,8 @@ final class StudioModel: ObservableObject {
                       $0.durationBeats > 0 && $0.durationBeats < 100_000 && $0.sourceDurationSeconds.isFinite &&
                       $0.sourceDurationSeconds > 0 && $0.sourceOffsetSeconds.isFinite && $0.sourceOffsetSeconds >= 0 &&
                       ($0.playbackOffsetSeconds ?? 0).isFinite && ($0.playbackOffsetSeconds ?? 0) >= 0 &&
+                      ($0.leadingSilenceSeconds ?? 0).isFinite && ($0.leadingSilenceSeconds ?? 0) >= 0 &&
+                      ($0.trailingSilenceSeconds ?? 0).isFinite && ($0.trailingSilenceSeconds ?? 0) >= 0 &&
                       ($0.midiSourceBPM == nil || ($0.midiSourceBPM!.isFinite && $0.midiSourceBPM! > 0)) &&
                       ($0.loopLengthSeconds ?? 1).isFinite && ($0.loopLengthSeconds ?? 1) > 0
                   }) else { throw MessageError("This project contains invalid timing or audio settings.") }
@@ -681,6 +879,8 @@ final class StudioModel: ObservableObject {
             restoreTrackInstrument()
             selectedClipID = nil
             status = "Opened \(url.lastPathComponent)"
+            selectingTracks = true
+            trackSelectionAnchor = nil
         } catch { present(error) }
     }
 
@@ -761,7 +961,7 @@ final class StudioModel: ObservableObject {
                     next.tracks[destinations[index]].clips.append(clip)
                 }
                 next.key = request.key
-                next.refreshLength()
+                next.refreshLength(extendingTo: start + Double(request.bars * 4))
                 beginEdit("Generate Music"); defer { endEdit() }
                 project = next
                 selectedTrackID = next.tracks[destinations[0]].id
@@ -829,7 +1029,7 @@ final class StudioModel: ObservableObject {
                     generationMethod: "MusicGen Small • \(reference == nil ? "text prompt" : "track audio + text") • seed \(request.seed) • native 32 kHz mono",
                     generationReference: reference)
                 project.tracks[index].clips.append(clip)
-                project.refreshLength()
+                project.refreshLength(extendingTo: clip.endBeat)
                 project.lengthBeats = max(previousLength, project.lengthBeats)
                 selectedClipID = clip.id
                 selectedTrackID = trackID

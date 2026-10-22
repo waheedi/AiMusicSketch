@@ -100,6 +100,9 @@ struct ClipModel: Codable, Identifiable, Hashable {
     var instrumentAddOn: InstrumentConfiguration?
     // Opt-in on new supported keyboard takes only; legacy recordings stay audio.
     var notesEditable: Bool?
+    // Container padding is silent and remains outside the original source pattern.
+    var leadingSilenceSeconds: Double?
+    var trailingSilenceSeconds: Double?
 
     var endBeat: Double { startBeat + durationBeats }
     var assetURL: URL { URL(fileURLWithPath: assetPath) }
@@ -136,11 +139,19 @@ struct StudioProject: Codable, Hashable {
     var key = "C minor"
     var sampleRate = 48_000.0
     var lengthBeats = 64.0
+    // Optional so older projects retain their automatic end position.
+    var hasManualEnd: Bool?
     var tracks: [TrackModel] = (0..<4).map(TrackModel.new)
 
-    mutating func refreshLength() {
-        let clipEnd = tracks.flatMap(\.clips).map(\.endBeat).max() ?? 0
-        lengthBeats = max(16, ceil(clipEnd / 4) * 4)
+    var contentEndBeat: Double { tracks.flatMap(\.clips).map(\.endBeat).max() ?? 0 }
+
+    mutating func refreshLength(extendingTo beat: Double? = nil) {
+        if hasManualEnd == true {
+            // Ordinary edits must not undo an intentional shorter/longer ending.
+            if let beat, beat.isFinite, beat > lengthBeats { lengthBeats = ceil(beat / 4) * 4 }
+        } else {
+            lengthBeats = max(16, ceil(contentEndBeat / 4) * 4)
+        }
     }
 }
 

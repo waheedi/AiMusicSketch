@@ -57,7 +57,10 @@ struct SmokeTest {
 
     @MainActor
     private static func run() async throws {
+        try await PlaybackPerformanceTests.run()
+        if CommandLine.arguments.contains("--playback-only") { return }
         try assertUsability()
+        try await EditingFeatureTests.run()
         try await InstrumentTests.run()
         try assertOctaveShortcuts()
         try assertGenerationOutputRange()
@@ -67,8 +70,11 @@ struct SmokeTest {
         let studio = StudioModel()
         var observed = 0
         let subscription = studio.objectWillChange.sink { observed += 1 }
+        var cursorObserved = 0
+        let cursorSubscription = studio.audio.objectWillChange.sink { cursorObserved += 1 }
         studio.audio.playheadBeat = 12
-        try require(observed > 0, "nested playhead updates never reach the UI")
+        try require(observed == 0 && cursorObserved > 0, "cursor must update its own views without redrawing the entire studio")
+        withExtendedLifetime(cursorSubscription) {}
         withExtendedLifetime(subscription) {}
         let anchor = AVAudioTime.hostTime(forSeconds: 10)
         try require(TransportClock.beat(now: anchor - 1, anchor: anchor, start: 4, bpm: 120) == 4,
@@ -474,7 +480,8 @@ struct SmokeTest {
         let shorter = ClipEditing.resize(clip, leftEdge: false, to: 11, bpm: 120)
         try require(ClipNoteLayout.notes(for: shorter, bpm: 120).count == 2, "right resize stretched later notes into view")
         let revealed = ClipEditing.resize(shorter, leftEdge: false, to: 16, bpm: 120)
-        try require(ClipNoteLayout.notes(for: revealed, bpm: 120) == layout, "extending edge failed to reveal original notes")
+        try require(ClipNoteLayout.notes(for: revealed, bpm: 120) == ClipNoteLayout.notes(for: shorter, bpm: 120),
+                    "silent extension revealed trimmed notes")
         var faster = clip; faster.durationBeats *= 1.5
         try require(ClipNoteLayout.notes(for: faster, bpm: 180) == layout, "tempo edit shifted notes relative to rendered audio")
         var legacy = clip; legacy.midiSourceBPM = nil
@@ -662,9 +669,11 @@ struct SmokeTest {
         let trimmed = studio.clip(clip.id)!
         try require(trimmed.startBeat == 6 && trimmed.endBeat == 9 && trimmed.playbackOffsetSeconds == 1, "edge trim failed")
         studio.resizeClip(clip.id, leftEdge: false, to: 30)
-        try require(studio.clip(clip.id)!.endBeat == 12, "non-looped resize exceeds source")
+        try require(studio.clip(clip.id)!.endBeat == 30 && studio.clip(clip.id)!.trailingSilenceSeconds == 10.5,
+                    "right extension did not add silence")
         studio.resizeClip(clip.id, leftEdge: true, to: 0)
-        try require(studio.clip(clip.id)!.startBeat == 4, "left resize did not reveal source or exceeded it")
+        try require(studio.clip(clip.id)!.startBeat == 0 && studio.clip(clip.id)!.leadingSilenceSeconds == 3,
+                    "left extension did not add silence")
         studio.undo(); studio.undo(); studio.undo(); studio.undo()
         try require(studio.project == original, "resize history does not restore exact source offsets")
         studio.audio.playheadBeat = 8
@@ -701,15 +710,30 @@ struct SmokeTest {
         loop.loopEnabled = true
         loop.playbackOffsetSeconds = 0.5
         let expanded = ClipEditing.resize(loop, leftEdge: true, to: 1, bpm: 120)
-        try require(expanded.startBeat == 1 && expanded.endBeat == 12 && expanded.playbackOffsetSeconds == 3,
-                    "left extension lost wrapped loop phase")
+        try require(expanded.startBeat == 1 && expanded.endBeat == 12 && expanded.playbackOffsetSeconds == 0.5
+                    && expanded.leadingSilenceSeconds == 1.5, "left extension shifted the audible loop")
         let longer = ClipEditing.resize(expanded, leftEdge: false, to: 24, bpm: 120)
         let segments = scheduledSegments(for: longer, bpm: 120, fromBeat: 0)
-        try require(longer.endBeat == 24 && abs(segments.reduce(0) { $0 + $1.durationSeconds } - 11.5) < 0.0001,
-                    "loop resizing inserted silence instead of repeats")
+        try require(longer.endBeat == 24 && segments.first?.timelineStartSeconds == 2
+                    && abs(segments.reduce(0) { $0 + $1.durationSeconds } - 4) < 0.0001
+                    && ClipEditing.needsLoopRender(longer, bpm: 120), "loop padding changed existing audio or repetition length")
         try require(ClipEditing.resize(clip, leftEdge: true, to: 99, bpm: 120).durationBeats > 0,
                     "edge crossing inverted a clip")
-        print("PASS: undo/redo, atomic edits, slider grouping, branch invalidation, source-bounded resize and loop extension")
+        let trackID = studio.project.tracks[0].id
+        var second = clip; second.id = UUID(); second.startBeat = 16
+        var third = clip; third.id = UUID(); third.startBeat = 28
+        studio.project.tracks[0].clips = [clip, second, third]
+        studio.selectClip(trackID: trackID, clipID: clip.id)
+        studio.selectClip(trackID: trackID, clipID: third.id, range: true)
+        try require(studio.selectedClipIDs.count == 3, "Shift-click failed to select a clip range")
+        studio.selectClip(trackID: trackID, clipID: second.id, additive: true)
+        try require(studio.selectedClipIDs == [clip.id, third.id], "Command-click failed to toggle a clip")
+        let beforeDelete = studio.project
+        studio.deleteSelectedClip()
+        try require(studio.project.tracks[0].clips == [second], "bulk deletion removed the wrong clips")
+        studio.undo()
+        try require(studio.project == beforeDelete, "bulk deletion did not undo atomically")
+        print("PASS: undo/redo, atomic edits, silent padding, loop timing and clip multi-selection/deletion")
     }
 
     private static func assertExpandedEffects() throws {

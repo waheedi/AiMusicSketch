@@ -21,7 +21,10 @@ struct AudioWaveform: View {
         let seconds = clip.durationBeats * 60 / bpm
         for i in 0..<count {
             let fraction = Double(i) / Double(count)
-            var source = (clip.playbackOffsetSeconds ?? 0) + fraction * seconds
+            let elapsed = fraction * seconds - (clip.leadingSilenceSeconds ?? 0)
+            guard elapsed >= 0, fraction * seconds < seconds - (clip.trailingSilenceSeconds ?? 0) else { continue }
+            var source = (clip.playbackOffsetSeconds ?? 0) + elapsed
+            if !clip.loopEnabled && source >= clip.sourceRegionSeconds { continue }
             if clip.loopEnabled { source = source.truncatingRemainder(dividingBy: clip.sourceRegionSeconds) }
             source += clip.sourceOffsetSeconds
             guard source >= 0, source < clip.sourceDurationSeconds else { continue }

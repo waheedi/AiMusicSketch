@@ -2,12 +2,14 @@ import AppKit
 import SwiftUI
 
 enum StudioKeyAction {
-    case record, zoomIn, zoomOut
+    case record, zoomIn, zoomOut, deleteClips, selectAllClips
 
     static func action(for event: NSEvent) -> Self? {
         let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
         let key = event.charactersIgnoringModifiers?.lowercased()
         if modifiers.isEmpty && key == "r" { return .record }
+        if modifiers.isEmpty && [51, 117].contains(event.keyCode) { return .deleteClips }
+        if modifiers == .command && key == "a" { return .selectAllClips }
         if modifiers == .command || modifiers == [.command, .shift] {
             if key == "+" || key == "=" { return .zoomIn }
             if key == "-" { return .zoomOut }
@@ -48,6 +50,8 @@ struct StudioShortcuts: NSViewRepresentable {
                 case .record: studio.toggleRecording()
                 case .zoomIn: studio.zoomTimeline(inward: true)
                 case .zoomOut: studio.zoomTimeline(inward: false)
+                case .deleteClips: studio.deleteSelection()
+                case .selectAllClips: studio.selectAll()
                 }
                 return nil
             }

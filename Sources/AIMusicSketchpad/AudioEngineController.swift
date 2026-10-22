@@ -15,15 +15,18 @@ final class AudioEngineController: ObservableObject {
     @Published var playheadBeat = 0.0
 
     private var engine: AVAudioEngine?
-    private var players: [AVAudioPlayerNode] = []
     private var playheadTask: Task<Void, Never>?
-    private var trackMixers: [UUID: AVAudioMixerNode] = [:]
-    private var trackEffects: [UUID: [AVAudioNode]] = [:]
-    private var files: [AVAudioFile] = []
+    private var tracks: [UUID: PlaybackTrack] = [:]
     private var anchorHostTime: UInt64 = 0
     private var startBeat = 0.0
     private var bpm = 120.0
     private var playbackProject: StudioProject?
+    private var automatedTracks: [TrackModel] = []
+    var onFailure: ((String) -> Void)?
+
+    // Read-only counters also let the stress test catch loop/player explosions.
+    var playerCount: Int { tracks.values.reduce(0) { $0 + $1.clips.count } }
+    var activePlayerCount: Int { tracks.values.reduce(0) { $0 + $1.clips.filter { $0.file != nil }.count } }
 
     var currentBeat: Double {
         guard isPlaying else { return playheadBeat }
@@ -51,58 +54,36 @@ final class AudioEngineController: ObservableObject {
             interleaved: false
         )!
         let soloed = project.tracks.contains(where: \.isSolo)
-        var scheduledPlayers: [(player: AVAudioPlayerNode, startDelay: Double)] = []
-
+        let endBeat = recording ? Double.infinity : project.lengthBeats
+        var playbackTracks: [UUID: PlaybackTrack] = [:]
         for baseTrack in project.tracks {
             let track = baseTrack.automated(at: fromBeat * 60 / project.bpm)
-            let mixer = AVAudioMixerNode()
-            let effects = makeEffects(settings: track.effects)
-            newEngine.attach(mixer)
-            effects.forEach(newEngine.attach)
-            connectTrackChain(engine: newEngine, mixer: mixer, effects: effects, format: format)
-            mixer.outputVolume = (track.isMuted || (soloed && !track.isSolo)) ? 0 : Float(track.volume)
-            mixer.pan = Float(track.pan)
-            trackMixers[track.id] = mixer
-            trackEffects[track.id] = effects
-
-            for clip in track.clips {
-                for segment in scheduledSegments(for: clip, bpm: project.bpm, fromBeat: fromBeat) {
-                    let file = try AVAudioFile(forReading: segment.url)
-                    let player = AVAudioPlayerNode()
-                    newEngine.attach(player)
-                    newEngine.connect(player, to: mixer, format: format)
-                    try scheduleFile(segment, file: file, on: player)
-                    files.append(file)
-                    let startDelay = max(
-                        0,
-                        segment.timelineStartSeconds - fromBeat * 60 / project.bpm
-                    )
-                    scheduledPlayers.append((player, startDelay))
-                }
-            }
+            guard track.clips.contains(where: { $0.endBeat > fromBeat && $0.startBeat < endBeat }) else { continue }
+            let runtime = PlaybackTrack(track: track, engine: newEngine, format: format, fromBeat: fromBeat, endBeat: endBeat)
+            runtime.apply(track, audible: !track.isMuted && (!soloed || track.isSolo))
+            if runtime.audible { try runtime.schedule(bpm: project.bpm, fromBeat: fromBeat, sampleRate: project.sampleRate) }
+            playbackTracks[track.id] = runtime
         }
 
+        // Keep an empty/all-muted transport valid, including recording into a new project.
+        _ = newEngine.mainMixerNode
         newEngine.prepare()
         try newEngine.start()
         // Establish the shared clock only after graph construction and engine startup.
         let anchorHostTime = mach_absolute_time() + AVAudioTime.hostTime(forSeconds: 0.15)
 
-        for scheduled in scheduledPlayers {
-            scheduled.player.play(
-                at: AVAudioTime(
-                    hostTime: anchorHostTime + AVAudioTime.hostTime(forSeconds: scheduled.startDelay)
-                )
-            )
-        }
+        let startTime = AVAudioTime(hostTime: anchorHostTime)
+        playbackTracks.values.filter(\.audible).forEach { $0.play(at: startTime) }
 
         engine = newEngine
-        players = scheduledPlayers.map(\.player)
+        tracks = playbackTracks
         playheadBeat = fromBeat
         isPlaying = true
         self.anchorHostTime = anchorHostTime
         self.startBeat = fromBeat
         self.bpm = project.bpm
-        playbackProject = project
+        playbackProject = project.preparedForPlayback()
+        refreshAutomatedTracks()
         startPlayhead(project: project, recording: recording)
         return anchorHostTime
     }
@@ -111,30 +92,56 @@ final class AudioEngineController: ObservableObject {
         if isPlaying { playheadBeat = currentBeat }
         playheadTask?.cancel()
         playheadTask = nil
-        players.forEach { $0.stop() }
-        players.removeAll()
+        tracks.values.forEach { $0.stop() }
         engine?.stop()
         engine = nil
         playbackProject = nil
-        files.removeAll()
-        trackMixers.removeAll()
-        trackEffects.removeAll()
+        automatedTracks.removeAll()
+        tracks.removeAll()
         isPlaying = false
         if resetPlayhead { playheadBeat = 0 }
     }
 
     func updateMix(project: StudioProject) {
-        if isPlaying { playbackProject = project }
-        applyMix(project: project, seconds: currentBeat * 60 / project.bpm)
+        guard isPlaying else { return }
+        let snapshot = project.preparedForPlayback()
+        playbackProject = snapshot
+        refreshAutomatedTracks()
+        let seconds = currentBeat * 60 / bpm
+        let soloed = project.tracks.contains(where: \.isSolo)
+        do {
+            for original in snapshot.tracks {
+                guard let runtime = tracks[original.id] else { continue }
+                let audible = !original.isMuted && (!soloed || original.isSolo)
+                let wasAudible = runtime.audible
+                if wasAudible && !audible { runtime.stop() }
+                runtime.apply(original.automated(at: seconds, presorted: true), audible: audible)
+                if !wasAudible && audible {
+                    // Start only the newly audible track, on the existing transport clock.
+                    let resumeHost = max(anchorHostTime, mach_absolute_time() + AVAudioTime.hostTime(forSeconds: 0.15))
+                    let resumeBeat = TransportClock.beat(now: resumeHost, anchor: anchorHostTime, start: startBeat, bpm: bpm)
+                    try runtime.schedule(bpm: bpm, fromBeat: resumeBeat, sampleRate: project.sampleRate)
+                    runtime.play(at: AVAudioTime(hostTime: resumeHost))
+                }
+            }
+        } catch {
+            stop()
+            onFailure?(error.localizedDescription)
+        }
     }
 
-    private func applyMix(project: StudioProject, seconds: Double) {
-        let soloed = project.tracks.contains(where: \.isSolo)
-        for original in project.tracks {
-            let track = original.automated(at: seconds)
-            trackMixers[track.id]?.outputVolume = (track.isMuted || (soloed && !track.isSolo)) ? 0 : Float(track.volume)
-            trackMixers[track.id]?.pan = Float(track.pan)
-            if let effects = trackEffects[track.id] { configureEffects(effects, settings: track.effects) }
+    private func refreshAutomatedTracks() {
+        guard let snapshot = playbackProject else { automatedTracks = []; return }
+        let soloed = snapshot.tracks.contains(where: \.isSolo)
+        automatedTracks = snapshot.tracks.filter {
+            !$0.isMuted && (!soloed || $0.isSolo) && $0.automation?.isEmpty == false
+        }
+    }
+
+    private func applyAutomation(seconds: Double) {
+        for original in automatedTracks {
+            guard let runtime = tracks[original.id] else { continue }
+            runtime.apply(original.automated(at: seconds, presorted: true), audible: true)
         }
     }
 
@@ -148,20 +155,88 @@ final class AudioEngineController: ObservableObject {
     private func startPlayhead(project: StudioProject, recording: Bool) {
         playheadTask = Task { [weak self] in
             while !Task.isCancelled {
-                do { try await Task.sleep(for: .milliseconds(16)) } catch { return }
+                let interval = self?.automatedTracks.isEmpty == false ? 16 : 34
+                do { try await Task.sleep(for: .milliseconds(interval)) } catch { return }
                 guard !Task.isCancelled, let self else { return }
                 let beat = self.currentBeat
-                if let snapshot = self.playbackProject, snapshot.tracks.contains(where: { $0.automation?.isEmpty == false }) {
-                    self.applyMix(project: snapshot, seconds: beat * 60 / snapshot.bpm)
-                }
+                self.applyAutomation(seconds: beat * 60 / self.bpm)
                 if !recording && beat >= project.lengthBeats {
                     self.stop()
                     self.playheadBeat = project.lengthBeats
                     return
                 }
-                self.playheadBeat = beat
+                // Automation stays at ~60 Hz; visual transport needs only ~30 Hz.
+                if beat - self.playheadBeat >= self.bpm / 60 / 30 { self.playheadBeat = beat }
             }
         }
+    }
+}
+
+/// One player/file per clip, not per loop repetition. Overlapping clips remain independent.
+private final class PlaybackClip {
+    let clip: ClipModel
+    let player = AVAudioPlayerNode()
+    var file: AVAudioFile?
+    init(_ clip: ClipModel) { self.clip = clip }
+
+    func schedule(bpm: Double, fromBeat: Double, sampleRate: Double, endBeat: Double) throws {
+        let segments = scheduledSegments(for: clip, bpm: bpm, fromBeat: fromBeat, toBeat: endBeat)
+        guard !segments.isEmpty else { return }
+        let file = try AVAudioFile(forReading: clip.assetURL)
+        for segment in segments {
+            let frame = AVAudioFramePosition(((segment.timelineStartSeconds - fromBeat * 60 / bpm) * sampleRate).rounded())
+            try scheduleFile(segment, file: file, on: player, at: AVAudioTime(sampleTime: max(0, frame), atRate: sampleRate))
+        }
+        self.file = file
+    }
+    func stop() { player.stop(); file = nil }
+}
+
+private final class PlaybackTrack {
+    let mixer = AVAudioMixerNode()
+    let effects: [AVAudioNode]
+    let clips: [PlaybackClip]
+    private var lastSettings: EffectSettings?
+    private var mixConfigured = false
+    private(set) var audible = false
+    private let endBeat: Double
+
+    init(track: TrackModel, engine: AVAudioEngine, format: AVAudioFormat, fromBeat: Double, endBeat: Double) {
+        self.endBeat = endBeat
+        effects = makeEffects(settings: track.effects)
+        clips = track.clips.filter { $0.endBeat > fromBeat && $0.startBeat < endBeat }.map(PlaybackClip.init)
+        engine.attach(mixer)
+        effects.forEach(engine.attach)
+        connectTrackChain(engine: engine, mixer: mixer, effects: effects, format: format)
+        for clip in clips {
+            engine.attach(clip.player)
+            engine.connect(clip.player, to: mixer, format: format)
+        }
+    }
+    func apply(_ track: TrackModel, audible: Bool) {
+        let volume = audible ? Float(track.volume) : 0
+        if mixer.outputVolume != volume { mixer.outputVolume = volume }
+        if mixer.pan != Float(track.pan) { mixer.pan = Float(track.pan) }
+        if !audible {
+            if self.audible || !mixConfigured {
+                effects.compactMap { $0 as? AVAudioUnitEffect }.forEach { $0.bypass = true }
+            }
+            lastSettings = nil
+        } else if lastSettings != track.effects {
+            configureEffects(effects, settings: track.effects, previous: lastSettings)
+            lastSettings = track.effects
+        }
+        self.audible = audible
+        mixConfigured = true
+    }
+    func schedule(bpm: Double, fromBeat: Double, sampleRate: Double) throws {
+        for clip in clips { try clip.schedule(bpm: bpm, fromBeat: fromBeat, sampleRate: sampleRate, endBeat: endBeat) }
+    }
+    func play(at time: AVAudioTime) { clips.filter { $0.file != nil }.forEach { $0.player.play(at: time) } }
+    func stop() {
+        clips.forEach { $0.stop() }
+        // A bypassed delay/reverb must not replay its frozen pre-mute tail on unmute.
+        effects.forEach { $0.reset() }
     }
 }
 
@@ -175,36 +250,19 @@ enum OfflineMixRenderer {
             interleaved: false
         )!
         let soloed = project.tracks.contains(where: \.isSolo)
-        var players: [AVAudioPlayerNode] = []
-        var files: [AVAudioFile] = []
-        var chains: [(TrackModel, AVAudioMixerNode, [AVAudioNode])] = []
+        var chains: [(TrackModel, PlaybackTrack)] = []
 
-        for baseTrack in project.tracks {
-            let track = baseTrack.automated(at: 0)
-            let mixer = AVAudioMixerNode()
-            let effects = makeEffects(settings: track.effects)
-            engine.attach(mixer)
-            effects.forEach(engine.attach)
-            connectTrackChain(engine: engine, mixer: mixer, effects: effects, format: format)
-            mixer.outputVolume = (track.isMuted || (soloed && !track.isSolo)) ? 0 : Float(track.volume)
-            mixer.pan = Float(track.pan)
-            chains.append((baseTrack, mixer, effects))
-
-            for clip in track.clips {
-                for segment in scheduledSegments(for: clip, bpm: project.bpm, fromBeat: 0) {
-                    let file = try AVAudioFile(forReading: segment.url)
-                    let player = AVAudioPlayerNode()
-                    engine.attach(player)
-                    engine.connect(player, to: mixer, format: format)
-                    let startSample = AVAudioFramePosition(segment.timelineStartSeconds * project.sampleRate)
-                    try scheduleFile(segment, file: file, on: player,
-                                     at: AVAudioTime(sampleTime: startSample, atRate: project.sampleRate))
-                    files.append(file)
-                    players.append(player)
-                }
-            }
+        for baseTrack in project.preparedForPlayback().tracks {
+            guard !baseTrack.isMuted, !soloed || baseTrack.isSolo,
+                  baseTrack.clips.contains(where: { $0.startBeat < project.lengthBeats }) else { continue }
+            let track = baseTrack.automated(at: 0, presorted: true)
+            let runtime = PlaybackTrack(track: track, engine: engine, format: format, fromBeat: 0, endBeat: project.lengthBeats)
+            runtime.apply(track, audible: true)
+            try runtime.schedule(bpm: project.bpm, fromBeat: 0, sampleRate: project.sampleRate)
+            chains.append((baseTrack, runtime))
         }
 
+        _ = engine.mainMixerNode
         try engine.enableManualRenderingMode(
             .offline,
             format: format,
@@ -212,7 +270,12 @@ enum OfflineMixRenderer {
         )
         try engine.start()
         let zero = AVAudioTime(sampleTime: 0, atRate: project.sampleRate)
-        players.forEach { $0.play(at: zero) }
+        chains.forEach { $0.1.play(at: zero) }
+        defer {
+            chains.forEach { $0.1.stop() }
+            engine.stop()
+            engine.disableManualRenderingMode()
+        }
 
         var fileSettings = format.settings
         fileSettings[AVLinearPCMIsNonInterleaved] = false
@@ -237,11 +300,8 @@ enum OfflineMixRenderer {
             let quantum: AVAudioFrameCount = automatedChains.isEmpty ? engine.manualRenderingMaximumFrameCount : 256
             let frames = min(quantum, AVAudioFrameCount(remaining))
             let seconds = Double(engine.manualRenderingSampleTime) / project.sampleRate
-            for (base, mixer, effects) in automatedChains {
-                let track = base.automated(at: seconds)
-                mixer.outputVolume = (track.isMuted || (soloed && !track.isSolo)) ? 0 : Float(track.volume)
-                mixer.pan = Float(track.pan)
-                configureEffects(effects, settings: track.effects)
+            for (base, runtime) in automatedChains {
+                runtime.apply(base.automated(at: seconds, presorted: true), audible: true)
             }
             let status = try engine.renderOffline(frames, to: buffer)
             switch status {
@@ -258,10 +318,6 @@ enum OfflineMixRenderer {
                 throw StudioError.invalidAudio
             }
         }
-        players.forEach { $0.stop() }
-        engine.stop()
-        engine.disableManualRenderingMode()
-        withExtendedLifetime(files) {}
     }
 }
 
@@ -362,18 +418,23 @@ private func connectTrackChain(
 func scheduledSegments(
     for clip: ClipModel,
     bpm: Double,
-    fromBeat: Double
+    fromBeat: Double,
+    toBeat: Double = .infinity
 ) -> [ScheduledAudioSegment] {
     guard bpm.isFinite, bpm > 0, clip.durationBeats.isFinite, clip.durationBeats > 0,
           clip.sourceDurationSeconds > 0, clip.sourceOffsetSeconds >= 0,
           clip.sourceOffsetSeconds < clip.sourceDurationSeconds,
           clip.endBeat > fromBeat else { return [] }
     let secondsPerBeat = 60 / bpm
-    let clipStartSeconds = clip.startBeat * secondsPerBeat
-    let clipDurationSeconds = clip.durationBeats * secondsPerBeat
+    let leading = clip.leadingSilenceSeconds ?? 0
+    let clipStartSeconds = clip.startBeat * secondsPerBeat + leading
+    let clipDurationSeconds = max(0, min(clip.durationBeats * secondsPerBeat - leading - (clip.trailingSilenceSeconds ?? 0),
+                                         toBeat * secondsPerBeat - clipStartSeconds))
+    guard clipDurationSeconds > 0 else { return [] }
     let fromSeconds = fromBeat * secondsPerBeat
     let visibleStart = max(clipStartSeconds, fromSeconds)
     let initialSkip = visibleStart - clipStartSeconds
+    guard initialSkip < clipDurationSeconds else { return [] }
     let sourceLength = clip.sourceRegionSeconds
     let playbackOffset = clip.playbackOffsetSeconds ?? 0
 
@@ -438,33 +499,50 @@ private final class TrackReverb: AVAudioUnitReverb {
     }
 }
 
-private func configureEffects(_ effects: [AVAudioNode], settings: EffectSettings) {
+private func configureEffects(_ effects: [AVAudioNode], settings: EffectSettings, previous: EffectSettings? = nil) {
     guard effects.count == 7, let eq = effects[0] as? AVAudioUnitEQ,
           let compressor = effects[1] as? AVAudioUnitEffect,
           let drive = effects[2] as? AVAudioUnitDistortion, let crush = effects[3] as? AVAudioUnitDistortion,
           let filter = effects[4] as? AVAudioUnitEQ,
           let reverb = effects[5] as? TrackReverb, let delay = effects[6] as? AVAudioUnitDelay else { return }
-    for (band, gain) in zip(eq.bands, [settings.lowGain, settings.midGain, settings.highGain]) { band.gain = Float(gain) }
-    compressor.bypass = settings.compression == 0
-    setAudioUnitParameter(compressor.audioUnit, id: AudioUnitParameterID(kDynamicsProcessorParam_Threshold), value: Float(-5 - settings.compression * 35))
-    setAudioUnitParameter(compressor.audioUnit, id: AudioUnitParameterID(kDynamicsProcessorParam_HeadRoom), value: Float(40 - settings.compression * 35))
-    reverb.setSpace(settings.reverbSpace)
-    // Loading a factory space can reset mix parameters.
-    reverb.wetDryMix = Float(settings.reverb * 100)
-    delay.wetDryMix = Float(settings.delay * 100)
-    delay.delayTime = max(0.01, min(2, settings.delayTime))
-    delay.feedback = Float(max(0, min(0.85, settings.delayFeedback)) * 100)
-    drive.bypass = settings.drive <= 0
-    drive.wetDryMix = Float(max(0, min(1, settings.drive)) * 100)
-    crush.bypass = settings.bitCrush <= 0
-    crush.wetDryMix = Float(max(0, min(1, settings.bitCrush)) * 100)
-    let band = filter.bands[0]
-    band.bypass = settings.filterMode == .off
-    switch settings.filterMode {
-    case .off, .lowPass: band.filterType = .resonantLowPass
-    case .highPass: band.filterType = .resonantHighPass
-    case .bandPass: band.filterType = .bandPass
+    if previous?.lowGain != settings.lowGain || previous?.midGain != settings.midGain || previous?.highGain != settings.highGain {
+        for (band, gain) in zip(eq.bands, [settings.lowGain, settings.midGain, settings.highGain]) { band.gain = Float(gain) }
+        eq.bypass = settings.lowGain == 0 && settings.midGain == 0 && settings.highGain == 0
     }
-    band.frequency = Float(max(20, min(20_000, settings.filterCutoff)))
-    band.bandwidth = Float(2 - max(0, min(1, settings.filterResonance)) * 1.7)
+    if previous?.compression != settings.compression {
+        compressor.bypass = settings.compression == 0
+        setAudioUnitParameter(compressor.audioUnit, id: AudioUnitParameterID(kDynamicsProcessorParam_Threshold), value: Float(-5 - settings.compression * 35))
+        setAudioUnitParameter(compressor.audioUnit, id: AudioUnitParameterID(kDynamicsProcessorParam_HeadRoom), value: Float(40 - settings.compression * 35))
+    }
+    if previous?.reverbSpace != settings.reverbSpace || previous?.reverb != settings.reverb {
+        reverb.setSpace(settings.reverbSpace)
+        reverb.wetDryMix = Float(settings.reverb * 100)
+        reverb.bypass = settings.reverb <= 0
+    }
+    if previous?.delay != settings.delay {
+        delay.wetDryMix = Float(settings.delay * 100)
+        delay.bypass = settings.delay <= 0
+    }
+    if previous?.delayTime != settings.delayTime { delay.delayTime = max(0.01, min(2, settings.delayTime)) }
+    if previous?.delayFeedback != settings.delayFeedback { delay.feedback = Float(max(0, min(0.85, settings.delayFeedback)) * 100) }
+    if previous?.drive != settings.drive {
+        drive.bypass = settings.drive <= 0
+        drive.wetDryMix = Float(max(0, min(1, settings.drive)) * 100)
+    }
+    if previous?.bitCrush != settings.bitCrush {
+        crush.bypass = settings.bitCrush <= 0
+        crush.wetDryMix = Float(max(0, min(1, settings.bitCrush)) * 100)
+    }
+    let band = filter.bands[0]
+    if previous?.filterMode != settings.filterMode {
+        filter.bypass = settings.filterMode == .off
+        band.bypass = settings.filterMode == .off
+        switch settings.filterMode {
+        case .off, .lowPass: band.filterType = .resonantLowPass
+        case .highPass: band.filterType = .resonantHighPass
+        case .bandPass: band.filterType = .bandPass
+        }
+    }
+    if previous?.filterCutoff != settings.filterCutoff { band.frequency = Float(max(20, min(20_000, settings.filterCutoff))) }
+    if previous?.filterResonance != settings.filterResonance { band.bandwidth = Float(2 - max(0, min(1, settings.filterResonance)) * 1.7) }
 }

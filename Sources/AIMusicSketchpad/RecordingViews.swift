@@ -54,8 +54,7 @@ struct RecordingPanel: View {
                     Text("Uses your macOS default audio input. Use headphones while recording alongside other tracks.")
                         .font(.caption).foregroundStyle(.secondary)
                     Spacer()
-                    ProgressView(value: Double(studio.recording.inputLevel), total: 1)
-                        .frame(width: 160)
+                    InputLevelMeter(recording: studio.recording).frame(width: 160)
                 }
             }
         }
@@ -70,6 +69,11 @@ struct RecordingPanel: View {
             if recording { focusToken += 1 }
         }
     }
+}
+
+private struct InputLevelMeter: View {
+    @ObservedObject var recording: RecordingController
+    var body: some View { ProgressView(value: Double(recording.inputLevel), total: 1) }
 }
 
 private struct PianoKeyboard: NSViewRepresentable {

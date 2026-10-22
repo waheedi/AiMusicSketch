@@ -1,29 +1,37 @@
 import Foundation
 
 enum ClipEditing {
-    /// Resize without changing speed or modifying the source file. Looped clips
-    /// may grow in either direction; ordinary clips stop at their source bounds.
-    static func resize(_ clip: ClipModel, leftEdge: Bool, to beat: Double, bpm: Double) -> ClipModel {
+    /// Outward edges add silence; inward edges consume padding, then trim audio.
+    static func resize(_ clip: ClipModel, leftEdge: Bool, to beat: Double, bpm: Double, minimumBeats: Double = 0.0625) -> ClipModel {
         guard beat.isFinite, bpm.isFinite, bpm > 0 else { return clip }
         var result = clip
         let secondsPerBeat = 60 / bpm
         let phase = clip.playbackOffsetSeconds ?? 0
-        let minimum = min(0.0625, clip.durationBeats)
+        let leading = clip.leadingSilenceSeconds ?? 0
+        let trailing = clip.trailingSilenceSeconds ?? 0
+        let minimum = min(minimumBeats, clip.durationBeats)
         if leftEdge {
-            let earliest = clip.loopEnabled ? 0 : max(0, clip.startBeat - phase / secondsPerBeat)
-            let start = max(earliest, min(clip.endBeat - minimum, beat))
-            let elapsed = phase + (start - clip.startBeat) * secondsPerBeat
+            let start = max(0, min(clip.endBeat - minimum, beat))
+            guard start != clip.startBeat else { return clip }
+            let delta = (start - clip.startBeat) * secondsPerBeat
+            let elapsed = phase + max(0, delta - leading)
             let region = clip.sourceRegionSeconds
             result.playbackOffsetSeconds = clip.loopEnabled
                 ? (elapsed.truncatingRemainder(dividingBy: region) + region).truncatingRemainder(dividingBy: region)
                 : max(0, elapsed)
             result.startBeat = start
             result.durationBeats = clip.endBeat - start
+            result.leadingSilenceSeconds = max(0, leading - delta)
+            result.trailingSilenceSeconds = min(trailing, result.durationBeats * secondsPerBeat)
         } else {
-            let latest = clip.loopEnabled ? 99_999 : clip.startBeat + max(0, clip.sourceRegionSeconds - phase) / secondsPerBeat
-            let end = max(clip.startBeat + minimum, min(latest, beat))
+            let end = max(clip.startBeat + minimum, min(99_999, beat))
+            guard end != clip.endBeat else { return clip }
             result.durationBeats = end - clip.startBeat
+            result.trailingSilenceSeconds = max(0, trailing + (end - clip.endBeat) * secondsPerBeat)
+            result.leadingSilenceSeconds = min(leading, result.durationBeats * secondsPerBeat)
         }
+        if result.leadingSilenceSeconds == 0 { result.leadingSilenceSeconds = nil }
+        if result.trailingSilenceSeconds == 0 { result.trailingSilenceSeconds = nil }
         return result
     }
 
@@ -31,16 +39,10 @@ enum ClipEditing {
         guard beat > clip.startBeat, beat < clip.endBeat else {
             throw MessageError("Place the playhead inside the clip first.")
         }
-        var left = clip
-        var right = clip
-        left.durationBeats = beat - clip.startBeat
+        let left = resize(clip, leftEdge: false, to: beat, bpm: bpm, minimumBeats: 0)
+        var right = resize(clip, leftEdge: true, to: beat, bpm: bpm, minimumBeats: 0)
         right.id = UUID()
         right.name += " 2"
-        right.startBeat = beat
-        right.durationBeats = clip.endBeat - beat
-        let elapsed = (clip.playbackOffsetSeconds ?? 0) + left.durationBeats * 60 / bpm
-        right.playbackOffsetSeconds = clip.loopEnabled
-            ? elapsed.truncatingRemainder(dividingBy: clip.sourceRegionSeconds) : elapsed
         return (left, right)
     }
 
@@ -49,13 +51,7 @@ enum ClipEditing {
               end <= clip.endBeat + 0.0001, end - start >= 0.0625 else {
             throw MessageError("The trim range must be inside the clip and have a positive length.")
         }
-        var trimmed = clip
-        let elapsed = (clip.playbackOffsetSeconds ?? 0) + (start - clip.startBeat) * 60 / bpm
-        trimmed.playbackOffsetSeconds = clip.loopEnabled
-            ? elapsed.truncatingRemainder(dividingBy: clip.sourceRegionSeconds) : elapsed
-        trimmed.startBeat = start
-        trimmed.durationBeats = end - start
-        return trimmed
+        return resize(resize(clip, leftEdge: true, to: start, bpm: bpm), leftEdge: false, to: end, bpm: bpm)
     }
 
     static func loop(_ clip: ClipModel, times: Int, bpm: Double) -> ClipModel {
@@ -74,6 +70,8 @@ enum ClipEditing {
     }
 
     static func needsLoopRender(_ clip: ClipModel, bpm: Double) -> Bool {
+        if (clip.leadingSilenceSeconds ?? 0) > 0 || (clip.trailingSilenceSeconds ?? 0) > 0 { return true }
+        if !clip.loopEnabled && (clip.playbackOffsetSeconds ?? 0) + clip.durationBeats * 60 / bpm > clip.sourceRegionSeconds + 0.000001 { return true }
         guard clip.loopEnabled else { return false }
         let duration = clip.durationBeats * 60 / bpm
         let region = clip.sourceRegionSeconds
