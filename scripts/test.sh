@@ -6,17 +6,23 @@ output="${TMPDIR:-/tmp}/AIMusicSketchpadSmokeTest"
 
 cd "$project_dir"
 clang++ -std=c++17 -O2 -I Sources/SketchSynthDSP/include -c Sources/SketchSynthDSP/SketchSynthDSP.cpp -o "$output-dsp.o"
+clang++ -std=c++17 -O2 -I Sources/SketchSynthDSP/include -c Sources/SketchSynthDSP/SketchSequence.cpp -o "$output-sequence.o"
 swiftc -parse-as-library \
-    -I Sources/SketchSynthDSP/include "$output-dsp.o" -lc++ \
+    -I Sources/SketchSynthDSP/include "$output-dsp.o" "$output-sequence.o" -lc++ \
     Sources/AIMusicSketchpad/InstrumentAddOns.swift \
     Sources/AIMusicSketchpad/InstrumentAudioCapture.swift \
     Sources/AIMusicSketchpad/InstrumentControls.swift \
     Sources/AIMusicSketchpad/SurgePatchBank.swift \
+    Sources/AIMusicSketchpad/SurgePlayback.swift \
     Sources/AIMusicSketchpad/TimelineFollow.swift \
     Sources/AIMusicSketchpad/StudioShortcuts.swift \
     Sources/AIMusicSketchpad/Models.swift \
     Sources/AIMusicSketchpad/GenerationOutputRange.swift \
     Sources/AIMusicSketchpad/Automation.swift \
+    Sources/AIMusicSketchpad/AutomationView.swift \
+    Sources/AIMusicSketchpad/ContentView.swift \
+    Sources/AIMusicSketchpad/EditingViews.swift \
+    Sources/AIMusicSketchpad/NoteEditorSheet.swift \
     Sources/AIMusicSketchpad/MIDIRenderer.swift \
     Sources/AIMusicSketchpad/SignatureKit.swift \
     Sources/AIMusicSketchpad/SignatureSoundBank.swift \
@@ -29,6 +35,7 @@ swiftc -parse-as-library \
     Sources/AIMusicSketchpad/ClipMerge.swift \
     Sources/AIMusicSketchpad/ClipNoteLayout.swift \
     Sources/AIMusicSketchpad/ClipNoteView.swift \
+    Sources/AIMusicSketchpad/AudioWaveform.swift \
     Sources/AIMusicSketchpad/RecordingController.swift \
     Sources/AIMusicSketchpad/RecordingViews.swift \
     Sources/AIMusicSketchpad/TextAudioGenerator.swift \
@@ -38,5 +45,6 @@ swiftc -parse-as-library \
     scripts/InstrumentTests.swift \
     scripts/EditingFeatureTests.swift \
     scripts/PlaybackPerformanceTests.swift \
+    scripts/SurgePlaybackTests.swift \
     -o "$output"
 "$output" "$@"

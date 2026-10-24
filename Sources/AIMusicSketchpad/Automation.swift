@@ -5,6 +5,10 @@ enum AutomationParameter: String, Codable, CaseIterable, Identifiable {
     case compression = "Compression", reverb = "Reverb", delay = "Delay"
     case drive = "Drive", bitCrush = "Bit-crush", filterCutoff = "Filter cutoff", filterResonance = "Filter resonance"
     case delayTime = "Delay time", delayFeedback = "Delay feedback"
+    case surgeCutoff = "Surge · Cutoff", surgeResonance = "Surge · Resonance"
+    case surgeAttack = "Surge · Attack", surgeRelease = "Surge · Release", surgeWidth = "Surge · Width"
+    static let surgeControls: [Self] = [.surgeCutoff, .surgeResonance, .surgeAttack, .surgeRelease, .surgeWidth]
+    var isSurge: Bool { Self.surgeControls.contains(self) }
     var id: String { rawValue }
     var scale: Double {
         switch self { case .lowGain, .midGain, .highGain: 24; default: 1 }
@@ -65,6 +69,11 @@ extension TrackModel {
             case .filterResonance: result.effects.filterResonance = max(0, min(1, effects.filterResonance + offset))
             case .delayTime: result.effects.delayTime = max(0.01, min(2, effects.delayTime + offset))
             case .delayFeedback: result.effects.delayFeedback = max(0, min(0.85, effects.delayFeedback + offset))
+            case .surgeCutoff, .surgeResonance, .surgeAttack, .surgeRelease, .surgeWidth:
+                if var settings = result.surgePlayback {
+                    settings.set(lane.parameter, value: settings.value(lane.parameter) + offset)
+                    result.surgePlayback = settings
+                }
             }
         }
         return result

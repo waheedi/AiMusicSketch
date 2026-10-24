@@ -125,6 +125,8 @@ struct TrackModel: Codable, Identifiable, Hashable {
     var generationSettings: GenerationRequest?
     var automation: [AutomationLane]?
     var instrumentConfiguration: InstrumentConfiguration?
+    // Opt-in: old projects continue to play the exact recorded WAV.
+    var surgePlayback: SurgePlaybackSettings?
 
     static func new(index: Int) -> TrackModel {
         let colors = ["4F8CFF", "A66BFF", "FF6B87", "F2A93B", "39B98A", "54B9D1", "D16BA5", "8BBF4D"]

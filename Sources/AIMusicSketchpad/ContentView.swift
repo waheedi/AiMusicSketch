@@ -199,6 +199,7 @@ private struct TimelineEditor: View {
     @GestureState private var draggedEndBeat: Double?
     private var displayedEndBeat: Double { draggedEndBeat ?? studio.project.lengthBeats }
     @AppStorage("timelineFollowPlayhead") private var followPlayhead = true
+    @AppStorage("timelineClipDisplay") private var clipDisplay = "both"
     @State private var scrollPosition = ScrollPosition(x: 0)
     @State private var viewport = TimelineViewport()
     private let rowHeight = 76.0
@@ -258,6 +259,14 @@ private struct TimelineEditor: View {
                     .help(followPlayhead ? "Follow Playhead is on — click to scroll freely" : "Follow Playhead is off — click to follow playback")
                     .accessibilityLabel("Follow Playhead")
                 Toggle("Snap ¼ beat", isOn: $studio.snapEnabled).toggleStyle(.checkbox)
+                Menu {
+                    Picker("Clip display", selection: $clipDisplay) {
+                        Text("MIDI notes + recorded audio").tag("both")
+                        Text("MIDI notes only").tag("notes")
+                        Text("Recorded audio only").tag("audio")
+                    }
+                } label: { Image(systemName: "waveform.path") }
+                .fixedSize().help("Clip display: MIDI shows keys played; audio shows the recorded sound, including synth rhythms.")
                 Text("Zoom").font(.caption)
                 Button { studio.zoomTimeline(inward: false) } label: { Image(systemName: "minus.magnifyingglass") }
                     .help("Zoom out (⌘−)")
@@ -360,7 +369,7 @@ private struct TimelineEditor: View {
                             .foregroundStyle(.secondary)
                         if let parameter = studio.visibleAutomation[track.id] {
                             Picker("Automation", selection: Binding(get: { studio.visibleAutomation[track.id] ?? parameter }, set: { studio.visibleAutomation[track.id] = $0 })) {
-                                ForEach(AutomationParameter.allCases) { Text($0.rawValue).tag($0) }
+                                ForEach(AutomationParameter.allCases.filter { !$0.isSurge || track.surgePlayback?.enabled == true }) { Text($0.rawValue).tag($0) }
                             }.labelsHidden().frame(width: 104)
                             Text("Click curve to add points\nDrag points • zero = base")
                                 .font(.system(size: 9)).foregroundStyle(.secondary)
@@ -449,7 +458,7 @@ private struct TimelineEditor: View {
                         AutomationEditor(studio: studio, track: track, parameter: parameter, beatWidth: beatWidth)
                     }
                     }
-                    .zIndex(track.clips.contains { $0.id == studio.draggingClipID } ? 10 : 0)
+                    .zIndex(track.clips.contains { studio.clipMovePreview?.ids.contains($0.id) == true } ? 10 : 0)
                 }
             }
             Rectangle().fill(Color.black.opacity(0.2))
@@ -574,9 +583,14 @@ private struct TimelineClip: View {
     let color: Color
     let beatWidth: Double
     let height: Double
+    @AppStorage("timelineClipDisplay") private var clipDisplay = "both"
     @GestureState private var dragOffset = CGSize.zero
     private struct ResizeDrag: Equatable { var left: Bool; var delta: Double }
     @GestureState private var resizeDrag: ResizeDrag?
+    private var groupMove: ClipMove? {
+        guard let move = studio.clipMovePreview, move.ids.contains(clip.id) else { return nil }
+        return move
+    }
     private var preview: ClipModel {
         guard let resizeDrag else { return clip }
         let edge = resizeDrag.left ? clip.startBeat : clip.endBeat
@@ -601,8 +615,19 @@ private struct TimelineClip: View {
                     lineWidth: studio.selectedClipIDs.contains(clip.id) ? 2 : 1
                 )
             Group {
-                if preview.midiNotes != nil {
-                    ClipNoteView(clip: preview, bpm: studio.project.bpm)
+                if preview.midiNotes?.isEmpty == false && clipDisplay != "audio" {
+                    if clipDisplay == "notes" {
+                        ClipNoteView(clip: preview, bpm: studio.project.bpm)
+                    } else {
+                        GeometryReader { geometry in
+                            VStack(spacing: 1) {
+                                ClipNoteView(clip: preview, bpm: studio.project.bpm)
+                                    .frame(height: geometry.size.height * 0.45)
+                                Rectangle().fill(.white.opacity(0.25)).frame(height: 0.5)
+                                AudioWaveform(clip: preview, bpm: studio.project.bpm)
+                            }
+                        }
+                    }
                 } else {
                     AudioWaveform(clip: preview, bpm: studio.project.bpm)
                 }
@@ -612,6 +637,7 @@ private struct TimelineClip: View {
             .padding(.bottom, 5)
             .frame(width: preview.durationBeats * beatWidth)
             .clipped()
+            .allowsHitTesting(false)
             HStack(spacing: 4) {
                 if clip.generatedPart != nil { Image(systemName: "sparkles") }
                 else if clip.midiNotes != nil { Image(systemName: "pianokeys") }
@@ -628,14 +654,12 @@ private struct TimelineClip: View {
         .gesture(
             DragGesture(minimumDistance: 3, coordinateSpace: .named("timeline"))
                 .updating($dragOffset) { value, state, _ in state = value.translation }
-                .onChanged { _ in
-                    if studio.draggingClipID != clip.id {
-                        studio.draggingClipID = clip.id
-                        studio.selectClip(trackID: trackID, clipID: clip.id)
-                    }
+                .onChanged { value in
+                    studio.previewClipMove(id: clip.id,
+                        on: studio.dragDestination(trackID: trackID, deltaY: value.translation.height),
+                        to: clip.startBeat + value.translation.width / beatWidth)
                 }
                 .onEnded { value in
-                    studio.draggingClipID = nil
                     studio.moveClip(
                         id: clip.id,
                         on: studio.dragDestination(trackID: trackID, deltaY: value.translation.height),
@@ -652,14 +676,15 @@ private struct TimelineClip: View {
                               additive: NSEvent.modifierFlags.contains(.command),
                               range: NSEvent.modifierFlags.contains(.shift))
         }
-        .help("⌘-click to toggle selection; Shift-click to select a range. Delete removes selected clips. Seek using the ruler above.")
+        .help("⌘/Shift-click selects; drag to move together. MIDI bars show held keys, not a synth’s internal notes. In dual display, recorded audio is below the divider.")
         .contextMenu { ClipContextMenu(studio: studio, trackID: trackID, clip: clip) }
-        .overlay(alignment: .leading) { trimHandle(left: true) }
-        .overlay(alignment: .trailing) { trimHandle(left: false) }
-        .offset(x: (dragOffset == .zero ? preview.startBeat : max(0, studio.snappedBeat(clip.startBeat + dragOffset.width / beatWidth))) * beatWidth, y: dragOffset.height)
-        .zIndex(studio.draggingClipID == clip.id ? 10 : 0)
+        .overlay(alignment: .leading) { if studio.selectedClipIDs.count <= 1 { trimHandle(left: true) } }
+        .overlay(alignment: .trailing) { if studio.selectedClipIDs.count <= 1 { trimHandle(left: false) } }
+        .offset(x: (preview.startBeat + (groupMove?.beatDelta ?? 0)) * beatWidth,
+                y: groupMove?.verticalOffsets[clip.id] ?? 0)
+        .zIndex(groupMove != nil ? 10 : 0)
         .onChange(of: dragOffset) { _, offset in
-            if offset == .zero, studio.draggingClipID == clip.id { studio.draggingClipID = nil }
+            if offset == .zero, studio.draggingClipID == clip.id { studio.cancelClipMove() }
         }
         .padding(.vertical, 7)
     }
@@ -668,7 +693,8 @@ private struct TimelineClip: View {
         RoundedRectangle(cornerRadius: 2)
             .fill(Color.white.opacity(studio.selectedClipIDs.contains(clip.id) ? 0.9 : 0.45))
             .frame(width: 4, height: 30)
-            .frame(width: min(16, max(18, preview.durationBeats * beatWidth) / 3), height: height)
+            .frame(width: min(8, max(18, preview.durationBeats * beatWidth) / 3), height: height - 22)
+            .offset(y: 9)
             .contentShape(Rectangle())
             .onHover { inside in
                 if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
@@ -720,6 +746,10 @@ private struct InspectorView: View {
             }
             inspectorSlider("Volume", value: $studio.project.tracks[index].volume, range: 0...1)
             inspectorSlider("Pan", value: $studio.project.tracks[index].pan, range: -1...1)
+
+            if studio.project.tracks[index].clips.contains(where: \.supportsLiveSurge) {
+                surgeControls(index: index)
+            }
 
             Text("MIX EFFECTS").font(.caption2.weight(.bold)).foregroundStyle(.secondary)
                 .padding(.top, 4)
@@ -790,6 +820,32 @@ private struct InspectorView: View {
                 Button("Split", systemImage: "scissors", action: studio.splitSelectedClip)
                 Button("Delete", systemImage: "trash", role: .destructive, action: studio.deleteSelectedClip)
             }
+        }
+    }
+
+    private func surgeControls(index: Int) -> some View {
+        let track = studio.project.tracks[index]
+        return VStack(alignment: .leading, spacing: 8) {
+            Text("SURGE XT · LIVE").font(.caption2.weight(.bold)).foregroundStyle(.purple)
+            Toggle("Live Surge playback", isOn: Binding(get: { track.surgePlayback?.enabled == true },
+                set: { studio.setLiveSurge(on: track.id, enabled: $0) }))
+                .disabled(studio.editingLocked)
+            if track.surgePlayback?.enabled == true {
+                ForEach(AutomationParameter.surgeControls) { parameter in
+                    HStack(spacing: 6) {
+                        inspectorSlider(parameter.rawValue.replacingOccurrences(of: "Surge · ", with: ""),
+                            value: Binding(get: { studio.project.tracks[index].surgePlayback?.value(parameter) ?? 0 },
+                                set: { studio.setSurgeControl(on: track.id, parameter: parameter, value: $0) }), range: -1...1)
+                        Button { studio.visibleAutomation[track.id] = parameter } label: {
+                            Image(systemName: "point.3.connected.trianglepath.dotted")
+                        }.help("Automate \(parameter.rawValue)")
+                    }
+                }
+                Text("0 = saved patch. Both scenes follow these offsets. Cutoff/resonance need Filter 1 enabled in the patch; attack affects new notes. Width cannot widen a mono sound. Curves add to the sliders.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            Text("Replays saved keys through Surge; modulation may differ from the recording. Off restores the original WAV. Audio-only clips stay unchanged.")
+                .font(.caption2).foregroundStyle(.secondary)
         }
     }
 

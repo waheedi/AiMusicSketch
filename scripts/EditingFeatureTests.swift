@@ -5,6 +5,8 @@ import Foundation
 enum EditingFeatureTests {
     @MainActor static func run() async throws {
         try await checkProjectEnd()
+        try checkGroupMove()
+        try checkHeldNoteWaveform()
         let studio = StudioModel()
         let original = studio.project
         let ids = original.tracks.map(\.id)
@@ -53,6 +55,92 @@ enum EditingFeatureTests {
         try InstrumentTests.check(ClipMerge.editableConfiguration(for: [a, b]) == nil, "Mixed presets must not lose their sound")
         print("PASS: multi-track selection/delete/Undo; selective MIDI merge, loop timing, note edits and mixed-preset fallback")
         if AudioUnitID.installed().contains(where: \.isSurgeXT) { try await checkBank() }
+    }
+
+    @MainActor static func checkHeldNoteWaveform() throws {
+        let preview = CommandLine.arguments.contains("--waveform-preview")
+        let url = preview ? URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("build/held-synth-preview.wav")
+            : FileManager.default.temporaryDirectory.appendingPathComponent("held-note-pulses-\(UUID()).wav")
+        defer { if !preview { try? FileManager.default.removeItem(at: url) } }
+        let format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 96_000)!
+        buffer.frameLength = buffer.frameCapacity
+        for frame in 0..<Int(buffer.frameLength) {
+            // One held key drives eight pulses; those are sound, not eight MIDI notes.
+            let value: Float = frame % 12_000 < 2_400 ? Float(sin(Double(frame) * 0.1)) * 0.5 : 0
+            buffer.floatChannelData![0][frame] = 0
+            buffer.floatChannelData![1][frame] = value
+        }
+        do {
+            var settings = format.settings; settings[AVLinearPCMIsNonInterleaved] = false
+            let file = try AVAudioFile(forWriting: url, settings: settings)
+            try file.write(from: buffer)
+        }
+        let peaks = try AudioWaveform.loadPeaks(url)
+        var pulses = 0, sounding = false
+        for peak in peaks {
+            if peak > 0.05 && !sounding { pulses += 1 }
+            sounding = peak > 0.05
+        }
+        let clip = ClipModel(name: "Held synth key", assetPath: url.path, startBeat: 0,
+                             durationBeats: 4, sourceDurationSeconds: 2,
+                             midiNotes: [MIDINote(pitch: 60, velocity: 0.8, startBeat: 0, durationBeats: 4)], midiSourceBPM: 120)
+        let notes = ClipNoteLayout.notes(for: clip, bpm: 120)
+        try InstrumentTests.check(peaks.count == 4_096 && pulses == 8 && peaks.contains(0),
+                                  "Recorded waveform must show stereo pulses and real silence")
+        try InstrumentTests.check(notes.count == 1 && notes[0].durationSeconds == 2,
+                                  "Sound pulses must not be invented as MIDI notes")
+        print("PASS: one held MIDI key stays one note; recorded stereo waveform shows eight pulses and silent gaps")
+    }
+
+    @MainActor static func checkGroupMove() throws {
+        let studio = StudioModel()
+        let rows = studio.project.tracks.map(\.id)
+        let a = ClipModel(name: "A", assetPath: "/unchanged.wav", startBeat: 1.1, durationBeats: 2,
+                          sourceDurationSeconds: 1, loopEnabled: true,
+                          midiNotes: [MIDINote(pitch: 64, velocity: 0.7, startBeat: 0.1, durationBeats: 0.4)],
+                          notesEditable: true, leadingSilenceSeconds: 0.1)
+        var b = a; b.id = UUID(); b.name = "B"; b.startBeat = 4.4; b.durationBeats = 5
+        var c = a; c.id = UUID(); c.name = "C"; c.startBeat = 8.6
+        var untouched = a; untouched.id = UUID(); untouched.startBeat = 15
+        studio.project.tracks[0].clips = [a, b, untouched]
+        studio.project.tracks[2].clips = [c]
+        studio.visibleAutomation[rows[0]] = .volume
+        studio.selectClip(trackID: rows[0], clipID: a.id)
+        studio.selectClip(trackID: rows[0], clipID: b.id, additive: true)
+        studio.selectClip(trackID: rows[2], clipID: c.id, additive: true)
+        let before = studio.project
+        let ids: Set<UUID> = [a.id, b.id, c.id]
+        studio.previewClipMove(id: b.id, on: rows[2], to: 6.12)
+        let preview = studio.clipMovePreview!
+        try InstrumentTests.check(studio.selectedClipIDs == ids && studio.project == before,
+                                  "Preview must not clear selection or change clips")
+        try InstrumentTests.check(abs(preview.beatDelta - 1.6) < 0.000001 && preview.trackDelta == 1,
+                                  "Group snap / last-track clamp")
+        try InstrumentTests.check(preview.verticalOffsets[a.id] == 176 && preview.verticalOffsets[c.id] == 76,
+                                  "Group preview must account for automation lane heights")
+        studio.moveClip(id: b.id, on: rows[2], to: 6.12)
+        for (original, row) in [(a, 1), (b, 1), (c, 3)] {
+            var expected = original; expected.startBeat += preview.beatDelta
+            try InstrumentTests.check(studio.clip(original.id) == expected && studio.location(original.id)?.track == row,
+                                      "Group move changed clip length, notes, source, gaps or row spacing")
+        }
+        try InstrumentTests.check(studio.clip(untouched.id) == untouched && studio.selectedClipIDs == ids
+                                  && studio.clipMovePreview == nil, "Group move affected unselected clip/selection")
+        let moved = studio.project
+        studio.undo(); try InstrumentTests.check(studio.project == before, "Group move must be one Undo")
+        studio.redo(); try InstrumentTests.check(studio.project == moved, "Group move Redo")
+        studio.previewClipMove(id: b.id, on: rows[0], to: -100)
+        let left = studio.clipMovePreview!
+        try InstrumentTests.check(abs(studio.clip(a.id)!.startBeat + left.beatDelta) < 0.000001
+                                  && left.trackDelta == -1, "Group must clamp together at timeline/first track")
+        studio.cancelClipMove()
+        try InstrumentTests.check(studio.project == moved, "Cancelled preview must leave project unchanged")
+        studio.previewClipMove(id: untouched.id, on: rows[0], to: 16)
+        try InstrumentTests.check(studio.selectedClipIDs == [untouched.id] && studio.clipMovePreview?.ids == [untouched.id],
+                                  "Dragging an unselected clip must move only that clip")
+        studio.cancelClipMove()
+        print("PASS: group drag selection/preview, one-delta timing, metadata, row bounds, automation heights, Undo/Redo/cancel")
     }
 
     @MainActor static func checkProjectEnd() async throws {

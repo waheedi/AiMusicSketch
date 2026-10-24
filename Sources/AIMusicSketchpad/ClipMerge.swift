@@ -1,6 +1,11 @@
 import Foundation
 
 enum ClipMerge {
+    static func surgeConfiguration(for clips: [ClipModel]) -> InstrumentConfiguration? {
+        guard let first = clips.first, first.supportsLiveSurge,
+              clips.allSatisfy({ $0.supportsLiveSurge && $0.instrumentAddOn == first.instrumentAddOn }) else { return nil }
+        return first.instrumentAddOn
+    }
     // Keep the rendered sound unchanged. Offer note editing only when one
     // instrument/preset can faithfully represent every source clip.
     static func editableConfiguration(for clips: [ClipModel]) -> InstrumentConfiguration? {

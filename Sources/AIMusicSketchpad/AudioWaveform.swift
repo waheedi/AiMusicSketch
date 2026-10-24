@@ -10,9 +10,10 @@ struct AudioWaveform: View {
             draw(context: context, size: size)
         }
         .task(id: clip.assetPath) {
-            let url = clip.assetURL
-            peaks = await Task.detached(priority: .utility) { (try? Self.loadPeaks(url)) ?? [] }.value
+            let loaded = await WaveformCache.shared.peaks(for: clip.assetURL)
+            if !Task.isCancelled { peaks = loaded }
         }
+        .accessibilityLabel("Recorded audio waveform; height is amplitude, not note pitch")
     }
 
     private func draw(context: GraphicsContext, size: CGSize) {
@@ -30,6 +31,7 @@ struct AudioWaveform: View {
             guard source >= 0, source < clip.sourceDurationSeconds else { continue }
             let position = source / clip.sourceDurationSeconds * Double(peaks.count)
             let index = min(peaks.count - 1, max(0, Int(position)))
+            guard peaks[index] > 0.0001 else { continue }
             let height = max(CGFloat(1), CGFloat(peaks[index]) * size.height)
             let rect = CGRect(x: CGFloat(fraction) * size.width, y: (size.height - height) / 2,
                               width: 2, height: height)
@@ -37,16 +39,17 @@ struct AudioWaveform: View {
         }
     }
 
-    nonisolated private static func loadPeaks(_ url: URL) throws -> [Float] {
+    nonisolated static func loadPeaks(_ url: URL) throws -> [Float] {
         let file = try AVAudioFile(forReading: url)
         guard file.length > 0, let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: 8_192) else { return [] }
-        var values = [Float](repeating: 0, count: 1_024)
+        let bins = 4_096
+        var values = [Float](repeating: 0, count: bins)
         while file.framePosition < file.length {
             let offset = file.framePosition
             try file.read(into: buffer)
             guard buffer.frameLength > 0, let channels = buffer.floatChannelData else { break }
             for frame in stride(from: 0, to: Int(buffer.frameLength), by: 4) {
-                let index = min(1_023, Int((offset + Int64(frame)) * 1_024 / file.length))
+                let index = min(bins - 1, Int((offset + Int64(frame)) * Int64(bins) / file.length))
                 for channel in 0..<Int(buffer.format.channelCount) {
                     values[index] = max(values[index], abs(channels[channel][frame]))
                 }
@@ -54,5 +57,21 @@ struct AudioWaveform: View {
         }
         let maximum = max(0.001, values.max() ?? 1)
         return values.map { min(1, $0 / maximum) }
+    }
+}
+
+/// Read each immutable take once, even when many clips share/loop its audio.
+/// The actor keeps disk analysis off the main thread and bounds memory use.
+private actor WaveformCache {
+    static let shared = WaveformCache()
+    private var values: [URL: [Float]] = [:]
+    private var order: [URL] = []
+
+    func peaks(for url: URL) -> [Float] {
+        if let cached = values[url] { return cached }
+        let peaks = (try? AudioWaveform.loadPeaks(url)) ?? []
+        values[url] = peaks; order.append(url)
+        if order.count > 64 { values.removeValue(forKey: order.removeFirst()) }
+        return peaks
     }
 }

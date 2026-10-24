@@ -1,5 +1,13 @@
 import Foundation
 
+struct ClipMove: Equatable {
+    let anchorID: UUID
+    let ids: Set<UUID>
+    let beatDelta: Double
+    let trackDelta: Int
+    let verticalOffsets: [UUID: Double]
+}
+
 enum ClipEditing {
     /// Outward edges add silence; inward edges consume padding, then trim audio.
     static func resize(_ clip: ClipModel, leftEdge: Bool, to beat: Double, bpm: Double, minimumBeats: Double = 0.0625) -> ClipModel {

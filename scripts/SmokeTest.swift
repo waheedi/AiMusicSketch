@@ -57,8 +57,10 @@ struct SmokeTest {
 
     @MainActor
     private static func run() async throws {
+        if CommandLine.arguments.contains("--live-surge-only") { try await SurgePlaybackTests.run(); return }
         try await PlaybackPerformanceTests.run()
         if CommandLine.arguments.contains("--playback-only") { return }
+        try await SurgePlaybackTests.run()
         try assertUsability()
         try await EditingFeatureTests.run()
         try await InstrumentTests.run()

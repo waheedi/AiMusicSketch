@@ -239,7 +239,7 @@ struct InstrumentControls: View {
                 Spacer()
             }
             Text(recording.configuration.audioUnit?.isSurgeXT == true
-                 ? "Surge XT: open Synth & Presets to browse sounds and edit oscillators, filters and effects. Save Project remembers your sound. AU takes record audio; note editing is not yet supported."
+                 ? "Surge XT: open Synth & Presets to edit sounds. For recorded clips, enable Live Surge playback in the track inspector for five automatable controls. AU note editing is not yet supported."
                  : "AU instruments only (not VST or effects). Load only plug-ins you trust. Some samplers need a sound bank in their own editor.")
                 .font(.caption).foregroundStyle(.secondary)
             DisclosureGroup("Plug-in parameters", isExpanded: $showParameters) {

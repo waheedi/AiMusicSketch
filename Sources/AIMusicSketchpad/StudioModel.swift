@@ -50,7 +50,8 @@ final class StudioModel: ObservableObject {
     @Published var visibleAutomation: [UUID: AutomationParameter] = [:]
     @Published var snapEnabled = true
     @Published var timelineBeatWidth = 34.0
-    @Published var draggingClipID: UUID?
+    @Published private(set) var clipMovePreview: ClipMove?
+    var draggingClipID: UUID? { clipMovePreview?.anchorID }
     private(set) var copiedClip: ClipModel?
     @Published var availableModels: [String] = []
     let audio = AudioEngineController()
@@ -296,6 +297,11 @@ final class StudioModel: ObservableObject {
         guard clips.count > 1,
               let start = clips.map(\.startBeat).min(), let end = clips.map(\.endBeat).max(),
               start.isFinite, end.isFinite, end > start else { return }
+        let surgeConfiguration = ClipMerge.surgeConfiguration(for: clips)
+        if original.surgePlayback?.enabled == true, clips.contains(where: \.supportsLiveSurge), surgeConfiguration == nil {
+            alertMessage = "These clips use different patches or include audio-only clips. Turn off Live Surge before merging them into an original-audio bounce, or merge clips with the same Surge patch."
+            return
+        }
         audio.stop()
         var dry = TrackModel.new(index: 0)
         dry.volume = 1
@@ -320,13 +326,19 @@ final class StudioModel: ObservableObject {
                     merged.instrument = configuration.builtIn
                     merged.instrumentAddOn = configuration
                     merged.notesEditable = true
+                } else if let configuration = surgeConfiguration {
+                    merged.midiNotes = ClipMerge.notes(for: clips, startingAt: start, bpm: snapshot.bpm)
+                    merged.midiSourceBPM = snapshot.bpm
+                    merged.instrumentAddOn = configuration
+                    merged.notesEditable = false
                 }
                 beginEdit("Merge Clips"); defer { endEdit() }
                 let mergedIDs = Set(clips.map(\.id))
                 project.tracks[index].clips.removeAll { mergedIDs.contains($0.id) }
                 project.tracks[index].clips.append(merged)
                 selectedTrackID = id; selectedClipID = merged.id
-                status = "Merged \(clips.count) clips • \(merged.notesEditable == true ? "notes remain editable" : "audio bounce (mixed instruments or audio)") • Undo restores originals"
+                let detail = merged.notesEditable == true ? "notes remain editable" : (merged.supportsLiveSurge ? "Surge notes and patch preserved" : "audio bounce (mixed instruments or audio)")
+                status = "Merged \(clips.count) clips • \(detail) • Undo restores originals"
             } catch {
                 try? FileManager.default.removeItem(at: url)
                 present(error)
@@ -457,17 +469,59 @@ final class StudioModel: ObservableObject {
         }
     }
 
+    private func clipMove(id: UUID, on trackID: UUID, to beat: Double) -> ClipMove? {
+        guard !editingLocked, beat.isFinite, let anchor = location(id),
+              let destination = project.tracks.firstIndex(where: { $0.id == trackID }) else { return nil }
+        let ids = selectedClipIDs.contains(id) ? selectedClipIDs : [id]
+        let members = project.tracks.enumerated().flatMap { row, track in
+            track.clips.filter { ids.contains($0.id) }.map { (row: row, clip: $0) }
+        }
+        guard let firstBeat = members.map({ $0.clip.startBeat }).min(),
+              let firstRow = members.map(\.row).min(), let lastRow = members.map(\.row).max() else { return nil }
+        // Snap the grabbed clip once, then apply the SAME delta to every member.
+        let delta = max(-firstBeat, snappedBeat(beat) - project.tracks[anchor.track].clips[anchor.clip].startBeat)
+        let rows = min(project.tracks.count - 1 - lastRow, max(-firstRow, destination - anchor.track))
+        var tops = [0.0]
+        for track in project.tracks { tops.append(tops.last! + trackHeight(track.id)) }
+        let offsets = Dictionary(uniqueKeysWithValues: members.map {
+            ($0.clip.id, tops[$0.row + rows] - tops[$0.row])
+        })
+        return ClipMove(anchorID: id, ids: Set(members.map { $0.clip.id }), beatDelta: delta,
+                        trackDelta: rows, verticalOffsets: offsets)
+    }
+
+    func previewClipMove(id: UUID, on trackID: UUID, to beat: Double) {
+        guard !editingLocked, let source = location(id) else { return }
+        if !selectedClipIDs.contains(id) { selectClip(trackID: project.tracks[source.track].id, clipID: id) }
+        let move = clipMove(id: id, on: trackID, to: beat)
+        if clipMovePreview != move { clipMovePreview = move }
+    }
+
+    func cancelClipMove() { clipMovePreview = nil }
+
     func moveClip(id: UUID, on trackID: UUID, to beat: Double) {
-        guard !editingLocked, beat.isFinite, let p = location(id),
-              let destination = project.tracks.firstIndex(where: { $0.id == trackID }) else { return }
-        beginEdit("Move Clip"); defer { endEdit() }
+        defer { cancelClipMove() }
+        guard let move = clipMove(id: id, on: trackID, to: beat), let anchor = location(id),
+              move.beatDelta != 0 || move.trackDelta != 0 else { return }
+        beginEdit(move.ids.count > 1 ? "Move Clips" : "Move Clip"); defer { endEdit() }
         audio.stop()
-        var moved = project.tracks[p.track].clips.remove(at: p.clip)
-        moved.startBeat = snappedBeat(max(0, beat))
-        project.tracks[destination].clips.append(moved)
-        selectedTrackID = trackID
+        let original = project.tracks
+        var tracks = original
+        for row in tracks.indices { tracks[row].clips.removeAll { move.ids.contains($0.id) } }
+        var movedEnd = 0.0
+        for (row, track) in original.enumerated() {
+            for var clip in track.clips where move.ids.contains(clip.id) {
+                clip.startBeat = move.ids.count == 1 ? max(0, snappedBeat(beat)) : clip.startBeat + move.beatDelta
+                movedEnd = max(movedEnd, clip.endBeat)
+                tracks[row + move.trackDelta].clips.append(clip)
+            }
+        }
+        project.tracks = tracks
+        selectedTrackID = tracks[anchor.track + move.trackDelta].id
         selectedClipID = id
-        project.refreshLength(extendingTo: moved.endBeat)
+        selectedClipIDs = move.ids
+        project.refreshLength(extendingTo: movedEnd)
+        status = move.ids.count > 1 ? "Moved \(move.ids.count) clips • spacing and lengths preserved" : "Clip moved"
     }
 
     func trackHeight(_ id: UUID) -> Double { visibleAutomation[id] == nil ? 76 : 176 }
@@ -548,6 +602,32 @@ final class StudioModel: ObservableObject {
         lanes[laneIndex].points.append(AutomationPoint(id: id, seconds: time, value: max(-1, min(1, value))))
         lanes[laneIndex].points.sort { $0.seconds < $1.seconds }
         project.tracks[index].automation = lanes
+    }
+
+    func setLiveSurge(on trackID: UUID, enabled: Bool) {
+        guard !editingLocked, let index = project.tracks.firstIndex(where: { $0.id == trackID }),
+              !enabled || project.tracks[index].clips.contains(where: \.supportsLiveSurge) else { return }
+        let wasPlaying = audio.isPlaying
+        let beat = audio.currentBeat
+        audio.stop()
+        beginEdit("Live Surge Playback"); defer { endEdit() }
+        var settings = project.tracks[index].surgePlayback ?? SurgePlaybackSettings()
+        settings.enabled = enabled
+        project.tracks[index].surgePlayback = settings
+        if !enabled, visibleAutomation[trackID]?.isSurge == true { visibleAutomation[trackID] = .volume }
+        if wasPlaying {
+            do { try audio.play(project: project, fromBeat: beat) } catch { present(error) }
+        }
+        status = enabled ? "Live Surge • five controls and timeline automation • original WAV preserved"
+                         : "Original recorded audio • Surge controls bypassed"
+    }
+
+    func setSurgeControl(on trackID: UUID, parameter: AutomationParameter, value: Double) {
+        guard !editingLocked, parameter.isSurge,
+              let index = project.tracks.firstIndex(where: { $0.id == trackID }) else { return }
+        var settings = project.tracks[index].surgePlayback ?? SurgePlaybackSettings()
+        settings.set(parameter, value: value)
+        project.tracks[index].surgePlayback = settings
     }
     func removeAutomationPoint(trackID: UUID, parameter: AutomationParameter, id: UUID) {
         guard !editingLocked, let t = project.tracks.firstIndex(where: { $0.id == trackID }),

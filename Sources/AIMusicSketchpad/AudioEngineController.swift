@@ -27,6 +27,7 @@ final class AudioEngineController: ObservableObject {
     // Read-only counters also let the stress test catch loop/player explosions.
     var playerCount: Int { tracks.values.reduce(0) { $0 + $1.clips.count } }
     var activePlayerCount: Int { tracks.values.reduce(0) { $0 + $1.clips.filter { $0.file != nil }.count } }
+    var liveInstrumentCount: Int { tracks.values.reduce(0) { $0 + $1.liveInstruments.count } }
 
     var currentBeat: Double {
         guard isPlaying else { return playheadBeat }
@@ -200,11 +201,24 @@ private final class PlaybackTrack {
     private var mixConfigured = false
     private(set) var audible = false
     private let endBeat: Double
+    private let sourceTrack: TrackModel
+    private weak var engine: AVAudioEngine?
+    private let format: AVAudioFormat
+    private var currentTrack: TrackModel
+    private var fromSeconds = 0.0
+    private var rate = 48_000.0
+    private(set) var liveInstruments: [LiveSurgeInstrument] = []
 
     init(track: TrackModel, engine: AVAudioEngine, format: AVAudioFormat, fromBeat: Double, endBeat: Double) {
         self.endBeat = endBeat
+        self.sourceTrack = track
+        self.currentTrack = track
+        self.engine = engine
+        self.format = format
         effects = makeEffects(settings: track.effects)
-        clips = track.clips.filter { $0.endBeat > fromBeat && $0.startBeat < endBeat }.map(PlaybackClip.init)
+        clips = track.clips.filter {
+            $0.endBeat > fromBeat && $0.startBeat < endBeat && !(track.surgePlayback?.enabled == true && $0.supportsLiveSurge)
+        }.map(PlaybackClip.init)
         engine.attach(mixer)
         effects.forEach(engine.attach)
         connectTrackChain(engine: engine, mixer: mixer, effects: effects, format: format)
@@ -214,6 +228,8 @@ private final class PlaybackTrack {
         }
     }
     func apply(_ track: TrackModel, audible: Bool) {
+        currentTrack = track
+        if let settings = track.surgePlayback { liveInstruments.forEach { $0.apply(settings) } }
         let volume = audible ? Float(track.volume) : 0
         if mixer.outputVolume != volume { mixer.outputVolume = volume }
         if mixer.pan != Float(track.pan) { mixer.pan = Float(track.pan) }
@@ -230,11 +246,29 @@ private final class PlaybackTrack {
         mixConfigured = true
     }
     func schedule(bpm: Double, fromBeat: Double, sampleRate: Double) throws {
+        fromSeconds = fromBeat * 60 / bpm
+        rate = sampleRate
+        // Muted tracks never reach this path at startup, so they load no synths.
+        if liveInstruments.isEmpty, sourceTrack.surgePlayback?.enabled == true, let engine {
+            let eligible = sourceTrack.clips.filter { $0.supportsLiveSurge && $0.endBeat > fromBeat && $0.startBeat < endBeat }
+            let groups = Dictionary(grouping: eligible, by: { $0.instrumentAddOn! })
+            for (configuration, clips) in groups {
+                let instrument = try LiveSurgeInstrument(configuration: configuration, clips: clips, bpm: bpm, endBeat: endBeat)
+                engine.attach(instrument.unit)
+                engine.connect(instrument.unit, to: mixer, format: format)
+                if let settings = currentTrack.surgePlayback { instrument.apply(settings) }
+                liveInstruments.append(instrument)
+            }
+        }
         for clip in clips { try clip.schedule(bpm: bpm, fromBeat: fromBeat, sampleRate: sampleRate, endBeat: endBeat) }
     }
-    func play(at time: AVAudioTime) { clips.filter { $0.file != nil }.forEach { $0.player.play(at: time) } }
+    func play(at time: AVAudioTime) {
+        clips.filter { $0.file != nil }.forEach { $0.player.play(at: time) }
+        liveInstruments.forEach { $0.play(at: time, fromSeconds: fromSeconds, sampleRate: rate) }
+    }
     func stop() {
         clips.forEach { $0.stop() }
+        liveInstruments.forEach { $0.stop() }
         // A bypassed delay/reverb must not replay its frozen pre-mute tail on unmute.
         effects.forEach { $0.reset() }
     }
